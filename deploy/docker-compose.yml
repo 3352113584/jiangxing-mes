@@ -1,0 +1,50 @@
+# ============================================================
+# MES 钢结构出口加工厂 - Docker Compose（开发环境）
+# ============================================================
+# 仅用于本机开发，不暴露到公网。
+# 数据库账号、密码通过 deploy/.env 注入，不硬编码。
+# 数据通过 Docker Volume 持久化。
+# ============================================================
+
+services:
+  postgres:
+    # 使用 PostgreSQL 16 官方稳定镜像
+    # （PostgreSQL 16 为当前成熟稳定版本，非实验版本）
+    image: postgres:16-alpine
+    container_name: mes-postgres-dev
+    restart: unless-stopped
+    # 仅监听本机 127.0.0.1，禁止对外网开放
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jiangxing_mes}
+      POSTGRES_USER: ${POSTGRES_USER:-mes_user}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in deploy/.env}"
+      # 时区：Asia/Shanghai
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+      # 默认字符集（postgres 镜像默认即 UTF8，显式声明）
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    volumes:
+      # 数据持久化
+      - mes_postgres_data_dev:/var/lib/postgresql/data
+      # 初始化脚本目录（如后续需要初始化扩展，可放 .sql 文件到这里）
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mes_user} -d ${POSTGRES_DB:-jiangxing_mes}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - mes-dev-net
+
+volumes:
+  mes_postgres_data_dev:
+    name: mes_postgres_data_dev
+    driver: local
+
+networks:
+  mes-dev-net:
+    name: mes-dev-net
+    driver: bridge

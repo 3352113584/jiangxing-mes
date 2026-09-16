@@ -1,0 +1,197 @@
+# ============================================================
+# MES 钢结构出口加工厂 - .gitignore
+# ============================================================
+
+# -------------------- 环境变量 / 敏感信息 --------------------
+.env
+.env.*
+!.env.example
+*.local
+.env.production
+.env.staging
+.env.development.local
+*.key
+*.pem
+*.crt
+secrets.json
+
+# -------------------- Python / FastAPI --------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+# 类型检查 / lint 缓存
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# -------------------- Node.js / Vue / Vite --------------------
+node_modules/
+.pnp
+.pnp.js
+.pnp.*
+.yarn/cache
+.yarn/install-state.gz
+.yarn/build-state.yml
+yarn-error.log
+yarn-debug.log*
+npm-debug.log*
+pnpm-debug.log*
+pnpm-store/
+# Vite 构建产物
+dist/
+dist-ssr/
+*.local
+.vite/
+# 前端测试覆盖率
+coverage/
+nyc-output/
+
+# -------------------- Android / Kotlin / Gradle --------------------
+# Gradle
+.gradle/
+build/
+app/build/
+*.apk
+*.ap_
+*.aab
+*.dex
+# Keystore（签名密钥，绝不提交）
+*.jks
+*.keystore
+keystore.properties
+# Local properties（包含 SDK 路径，不应提交）
+local.properties
+# NDK
+.cxx/
+# Android Studio / IntelliJ
+*.iml
+.idea/
+out/
+# Kotlin
+.kotlin/
+# Google Services（如果用到）
+google-services.json
+
+# -------------------- IDE 通用配置 --------------------
+# IntelliJ / Android Studio / WebStorm 等 JetBrains 系列
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+# VS Code（本机未安装，但预防）
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.history/
+# Trae CN
+.trae/
+.trae-cn/
+# Sublime / Vim / Emacs 等其他编辑器
+*.sublime-workspace
+*.sublime-project
+*~
+.*.swp
+.*.swo
+.netrwhist
+*.swo
+
+# -------------------- Docker --------------------
+# 不提交运行时数据
+docker-data/
+docker-compose.override.yml
+# 容器卷数据
+pgdata/
+postgres-data/
+redis-data/
+
+# -------------------- Windows / macOS / Linux 系统文件 --------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+# Linux
+*~
+.directory
+.fuse_hidden*
+.Trash-*
+
+# -------------------- 日志 / 临时文件 --------------------
+logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+
+# -------------------- 数据库相关 --------------------
+# 不提交数据库备份或导出
+*.sql.bak
+*.dump
+*.db
+*.sqlite
+*.sqlite3
+
+# -------------------- 其他 --------------------
+.cache/
+*.tgz
+.yarnrc
+.eslintcache
+.stylelintcache
+.parcel-cache
