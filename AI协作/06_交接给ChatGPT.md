@@ -8,7 +8,9 @@
 
 - 项目：钢结构出口加工厂 MES（PostgreSQL + 后端 + Android 扫码 + 前端）
 - 业务依据：`docs/v1.2_business_decisions_v2.md` 第六轮 Part 20（业务冻结候选，最高权威）
-- 当前阶段：**第一阶段数据库领域建模已冻结，等待架构审查**
+- 当前阶段：**第一阶段整改完成（《整改指令 V1》18 RED + 10 ORANGE 收口），等待下一轮架构复审**
+- 整改决议：`docs/v1.2_architecture_review_resolution.md`（逐项决议 + 指标表 + 场景 A-J 压测 + OPEN-1/2/3）
+- 阅读入口：`v1.2_business_decisions_v2.md` 顶部「★ 当前生效规则速查」为唯一权威；领域模型第 21 章为整改增补
 - Git：GitHub 私有仓库 `https://github.com/3352113584/jiangxing-mes`（main 已同步），可直接在网页上阅读 `docs/` 与 `AI协作/` 全部文档
 - 公开审查仓库：`https://github.com/3352113584/jiangxing-mes-architecture`（同套 docs/ 与 AI协作/，另含 2 份脱敏样例构件清单：`docs/客户X-电极生产车间B区.xlsx` 约 600 行、`docs/2#厂房构件清单.xlsx` 约 233 行，可作真实数据体量与结构参考）
 
