@@ -10,6 +10,7 @@
 - 业务依据：`docs/v1.2_business_decisions_v2.md` 第六轮 Part 20（业务冻结候选，最高权威）
 - 当前阶段：**第一阶段数据库领域建模已冻结，等待架构审查**
 - Git：GitHub 私有仓库 `https://github.com/3352113584/jiangxing-mes`（main 已同步），可直接在网页上阅读 `docs/` 与 `AI协作/` 全部文档
+- 公开审查仓库：`https://github.com/3352113584/jiangxing-mes-architecture`（同套 docs/ 与 AI协作/，另含 2 份脱敏样例构件清单：`docs/客户X-电极生产车间B区.xlsx` 约 600 行、`docs/2#厂房构件清单.xlsx` 约 233 行，可作真实数据体量与结构参考）
 
 ### 请 ChatGPT 审查的内容
 
