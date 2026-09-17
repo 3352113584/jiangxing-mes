@@ -9,7 +9,7 @@
 - 项目：钢结构出口加工厂 MES（PostgreSQL + 后端 + Android 扫码 + 前端）
 - 业务依据：`docs/v1.2_business_decisions_v2.md` 第六轮 Part 20（业务冻结候选，最高权威）
 - 当前阶段：**第一阶段数据库领域建模已冻结，等待架构审查**
-- Git：main 分支，无 remote，14 个未跟踪 docs 文档，仅 1 次初始提交
+- Git：GitHub 私有仓库 `https://github.com/3352113584/jiangxing-mes`（main 已同步），可直接在网页上阅读 `docs/` 与 `AI协作/` 全部文档
 
 ### 请 ChatGPT 审查的内容
 
