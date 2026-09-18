@@ -1,6 +1,6 @@
 # 匠星智造 MES V1.2 数据库物理设计（Phase 2 第一阶段交付物）
 
-> 文档：`database_design_v1.2.md` ｜ 生成时间：2026-09-18 ｜ 版本：V1.0
+> 文档：`database_design_v1.2.md` ｜ 生成时间：2026-09-18 ｜ 版本：V1.1（最终收口整改版——闭合验收报告 NB-1~NB-8，见 22 章；结构决策不变，字段级细化）
 > 上位依据：`v1.2_database_domain_model.md`（FROZEN，PHASE_2_READY=YES / G0=PASS）
 > 设计计划：`v1.2_phase2_database_design_plan.md`（15 节策略 + 第 0 节技术栈声明）
 > 性质：**Domain Model → PostgreSQL 物理设计**。完整、可实现、**不含 SQL / Migration / ORM 代码**。
@@ -389,7 +389,7 @@ Idempotency：`(subproject_id, file_hash, mapping_version)` 唯一（重复上�
 | source_identity | VARCHAR(255) | NO | | | | ✔(见上) | **稳定业务键（业务键标准化，如"子项目+构件号"）——幂等身份的另一半；source_identity ≠ row_number** |
 | content_fingerprint | VARCHAR(64) | YES | | | | | 内容指纹——**仅判内容变化**（同身份不同指纹=updated），不作身份判定 |
 | raw_payload | JSONB | NO | | | | | **原始行值留存（成功行与失败行均保留；来源 Excel 原始值一律由本列承载）** |
-| result_status | enum_import_row_status | NO | | | | | created/updated/kept/failed/conflict/rejected |
+| result_status | enum_import_row_status | NO | | | | | created/updated/kept/failed/conflict/rejected/**invalidated**（NB-8：本批次判定"原业务对象失效/被修正版移除"——落行留证，待人工批准后生效处置） |
 | error_type / error_message | VARCHAR(64)/TEXT | YES | | | | | 失败行错误归类/详情 |
 | target_ref_type | VARCHAR(32) CHECK | YES | | | | | 受控：component_list_item（V1 构件清单域） |
 | target_ref_id | BIGINT | YES | | | | | 目标业务记录（软引用 id 半边；失败行无 target）——CHECK (双空或双非空) |
@@ -398,16 +398,23 @@ Idempotency：`(subproject_id, file_hash, mapping_version)` 唯一（重复上�
 
 Constraints：CHECK (target 双空/双非空)；(import_batch_id, source_identity) UNIQUE。Index：(result_status)（失败行重试清单）、corrected_from_row_id。Lifecycle：**append-only，历史批次链永不删除**。
 
+**NB-8 失效语义（修正版导入的业务规则，最终收口定义）**：
+
+1. **"Excel 里没有这一行" ≠ 自动删除业务数据**。修正版导入对上一批次中存在、本批次缺失的 source_identity，服务层落一行 `result_status='invalidated'` 的 import_row（corrected_from_row_id 指向原批次对应行，raw_payload 存差异说明"修正版缺失"），**不直接修改任何业务记录**。
+2. **失效必须人工批准**：invalidated 行进入待处置清单（同 conflict 处置模式）；人工批准后，服务层将目标业务对象置为失效态（`component_list_item.row_status='voided'`——见 5.6），并在 `import_correction_result.rows_invalidated` 计数；未批准的 invalidated 行不产生任何业务效果。
+3. **允许失效的对象范围**：仅**未实例化**（无 actual_component 行、无 production_plan_line 引用）的 `component_list_item` 允许经导入修正失效；`material/批次/库存/生产/质量/发运` 等其他业务对象**不在导入失效能力范围内**（V1 导入域仅覆盖构件清单）。
+4. **已进入生产的对象禁止自动失效**：清单行已实例化 ⇒ 服务层拒绝处置，落 `result_status='conflict'` 走人工/更正域（与现有 conflict 规则一致）；**任何路径都不得物理删除原业务记录**（voided 行保留原值原身份，仅状态位翻转）。
+
 ### 5.3 imp.import_correction_result（修正导入净效果，R2-04）
 
 | Column | Type | Nullable | Default | PK | FK | Unique | Description |
 |---|---|---|---|---|---|---|---|
 | id / new_batch_id → imp.component_list_import_batch / superseded_batch_id → self 同表 FK | NO | | | | | (new_batch_id) ✔ | 一次修正导入一行净效果 |
-| rows_created / rows_updated / rows_kept / rows_conflict / rows_rejected | INT | NO | 0 | | | | 五类计数 |
-| decided_by / decided_at | | YES | | | | | conflict 人工决策人/时间 |
+| rows_created / rows_updated / rows_kept / rows_conflict / rows_rejected / **rows_invalidated** | INT | NO | 0 | | | | 六类计数（**rows_invalidated 为 NB-8 新增**：本批次判定失效并经人工批准的行数） |
+| decided_by / decided_at | | YES | | | | | conflict/invalidated 人工决策人/时间 |
 | 通用列 | | | | | | | B |
 
-规则：**conflict=被修正构件已有生产事实 → 禁止自动覆盖，必须人工决策**（应用约束 23）。
+规则：**conflict=被修正构件已有生产事实 → 禁止自动覆盖，必须人工决策**（应用约束 23）。**invalidated=修正版缺失行 → 人工批准后目标清单行置 voided，未批准不生效**（NB-8，5.2 失效语义）。
 
 ### 5.4 imp.import_field_mapping（版本化字段映射）
 
@@ -436,6 +443,7 @@ Constraints：CHECK (target 双空/双非空)；(import_batch_id, source_identit
 | source_remark | VARCHAR(512) | YES | | | | | 来源备注（**禁止混入类型/特征值**——R2-05） |
 | total_weight_declared | NUMERIC(12,3) | YES | | | | | 清单总重（导入原值——证明"总重≠单重×数量恒等"的 11/226 行证据留存） |
 | import_row_id | BIGINT | YES | | | imp.import_row | | 溯源导入行（Optional FK） |
+| **row_status** | VARCHAR(16) CHECK | NO | 'active' | | | | **active/voided（NB-8 新增）**：voided=经导入修正人工批准失效（5.2 规则 2~4）；voided 行保留全部原值，仅状态位翻转，严禁 DELETE；voided 后语义列（name/quantity 等）触发器禁改；voided 行禁被新实例化/新计划行引用（服务层，同约束 25 模式） |
 | 通用列 | | | | | | | A（更正留痕） |
 
 **Junction：prod.component_list_item_feature**（R2-05 落点，新增 junction）：(list_item_id FK, feature_id → ref.component_feature_dict FK)，PK(list_item_id, feature_id)。Index：feature_id。
@@ -503,11 +511,16 @@ Lifecycle：构件实例化事务内批量生成（与 actual_component 同事�
 | supplier_id | BIGINT | NO | | | md.supplier | | Mandatory FK |
 | grade_snapshot / spec_snapshot | VARCHAR | NO | | | | | 到货时材质/规格快照（与主数据解耦） |
 | original_weight | NUMERIC(12,3) | YES | | | | | 原始重量事实（到货登记） |
-| receipt_item_id | BIGINT | YES | | | whs.purchase_receipt_item | | 来源到货明细（Optional FK：期初/手工批次可空——**批次生成唯一入口=验收，关系 17**） |
+| **batch_source** | VARCHAR(20) CHECK | NO | 'receipt_acceptance' | | | | **批次来源（NB-5 新增）**：`receipt_acceptance`（默认唯一入口=验收事务）/`opening`（期初库存迁移）/`manual`（手工补建，如特殊材料批次/历史数据导入补建）——CHECK 收敛三值 |
+| receipt_item_id | BIGINT | YES | | | whs.purchase_receipt_item | | 来源到货明细（Optional FK）；**CHECK：batch_source='receipt_acceptance' ⇒ 非空；'opening'/'manual' ⇒ 必空**（默认入口结构性收敛，例外入口走下方审批列） |
 | received_at | DATE | YES | | | | | 到货日期 |
-| 通用列 | | | | | | | A+B |
+| **source_ref** | VARCHAR(255) | YES | | | | | **例外入口来源说明（NB-5 新增）**：CHECK：batch_source IN ('opening','manual') ⇒ 非空（如期初迁移凭证号/手工补建原因与单据引用）；'receipt_acceptance' ⇒ 必空 |
+| **approved_by / approved_at** | BIGINT / TIMESTAMP | YES | | | md.user_account / — | | **例外入口审批人/审批时间（NB-5 新增）**：CHECK：batch_source IN ('opening','manual') ⇒ 双非空（审批事实另经 aud.approval_record 留痕）；'receipt_acceptance' ⇒ 双空 |
+| 通用列 | | | | | | | B（append-only：批次身份与快照列事实后不可变） |
 
-Index：(heat_no)、(material_id)、(factory_batch_no)。**一车多 Heat 不合并**：不同 heat_no ⇒ 不同 material_batch 行（场景 J 落点）。
+Index：(heat_no)、(material_id)、(factory_batch_no)、(batch_source)。**一车多 Heat 不合并**：不同 heat_no ⇒ 不同 material_batch 行（场景 J 落点）。
+
+**批次入口规则（NB-5 收口，约束 32 修订表述）**：**默认唯一入口 = purchase_receipt_item 验收事务**（batch_source='receipt_acceptance'）；**例外入口仅 batch_source ∈ {'opening','manual'}**——必须同时满足：① source_ref 来源说明非空；② approved_by/approved_at 审批留痕非空；③ 审批事实另经 `aud.approval_record`（target_ref=material_batch）记录；④ 全部创建动作写 `aud.operation_log` 审计。**不得以任何方式放开"任意路径创建 material_batch"**；期初数据迁移（Phase 3）经本例外入口执行，无需合成 receipt_item。
 
 ### 6.2 whs.material_certificate（质保书） / 6.3 需求两表 / 6.4 过磅 / 6.5 磅差
 
@@ -546,7 +559,7 @@ Index：(heat_no)、(material_id)、(factory_batch_no)。**一车多 Heat 不合
 | received_by | BIGINT | NO | | | md.user_account | | 登记人 |
 | 通用列 | | | | | | | B 类（append-only；车次头不承载验收结论） |
 
-**到货预告边界（约束 32 落地）**：微信群等预告**不建表不入库**（链外）；本表创建（登记）本身**不产生** stock_ledger/stock_balance/material_batch/material_consumption——批次生成唯一入口=7.3 验收。**一车多 Heat**：由 receipt_item 逐行拆 batch（7.3→6.1），车头不做任何 Heat 归并。Index：(purchase_order_id)、(arrived_at)、(trip_no)。
+**到货预告边界（约束 32 落地）**：微信群等预告**不建表不入库**（链外）；本表创建（登记）本身**不产生** stock_ledger/stock_balance/material_batch/material_consumption——**批次默认唯一入口=7.3 验收**（例外入口仅 batch_source∈{opening,manual}+审批，NB-5，6.1）。**一车多 Heat**：由 receipt_item 逐行拆 batch（7.3→6.1），车头不做任何 Heat 归并。Index：(purchase_order_id)、(arrived_at)、(trip_no)。
 
 ### 7.3 whs.purchase_receipt_item（到货明细 = 验收行）
 
@@ -561,7 +574,7 @@ Index：(heat_no)、(material_id)、(factory_batch_no)。**一车多 Heat 不合
 | accepted_at / accepted_by | TIMESTAMP / BIGINT | YES | | | md.user_account | | 验收时间/人 |
 | 通用列 | | | | | | | B 类（append-only；验收结论变更走更正域） |
 
-**批次生成**：验收（acceptance_result_id 置值）事务内按行生成 material_batch 1..N（一炉一批，关系 17；**5 种材料 2 合格 3 待处理 = 5 行独立结论**，合格行生成批次、待处理行不生成）。过磅事实经 whs.weighing_record(receipt_item_id) 挂行。
+**批次生成**：验收（acceptance_result_id 置值）事务内按行生成 material_batch 1..N（一炉一批，关系 17；**5 种材料 2 合格 3 待处理 = 5 行独立结论**，合格行生成批次、待处理行不生成）——此为**默认唯一入口**（batch_source='receipt_acceptance'）；期初/手工补建走例外入口（batch_source∈{opening,manual}+source_ref+审批留痕，NB-5，6.1）。过磅事实经 whs.weighing_record(receipt_item_id) 挂行。
 
 ### 7.4 whs.stock_balance（库存余额——可重建当前值）
 
@@ -572,6 +585,8 @@ Index：(heat_no)、(material_id)、(factory_batch_no)。**一车多 Heat 不合
 | weight_kg | NUMERIC(12,3) | NO | 0 | | | CHECK >=0 | 库存重量余额 |
 | version | INT | NO | 1 | | | | 乐观锁（扣减并发）；关键扣减另用行锁 |
 | 通用列 | | | | | | | A 类（**由 stock_ledger 追加重建**，余额是缓存当前值——事实源=流水） |
+
+Index：✔唯一 (material_batch_id, storage_location_id)；**(storage_location_id, material_batch_id)（NB-7 新增）**——支撑"库位→现存批次/材料"查询路径（仓库现场：某库位现存什么材料/哪些批次）；扣减事务主路径仍走唯一索引前缀（batch→location 定位单行）。不加 (weight_kg) 等低选择性索引。
 
 ### 7.5 whs.stock_ledger（库存流水——**八类动作一本账，append-only**）
 
@@ -619,7 +634,7 @@ Index：(issued_at)、(subproject_id)。Lifecycle：append-only（作废走状�
 | storage_location_id | BIGINT | YES | | | md.storage_location | | 库位（Optional） |
 | requested_qty | NUMERIC(12,3) | NO | | | | | 计划/申请量（如 10t） |
 | issued_qty | NUMERIC(12,3) | YES | | | | | 实发累计（**由对应流水行聚合的可重建值；一行可对应 0..N 条流水**——10t 可 6t+4t 分两次过账，场景 B） |
-| 通用列 | | | | | | | B 类 |
+| 通用列 | | | | | | | B 类（**issued_qty 为聚合重建缓存列——窄路径 UPDATE：仅服务层过账/对账事务内随流水聚合刷新，触发器白名单仅此一列（NB-2 收口）；其余列 append-only**） |
 
 **关系 95 落地**：本行与 stock_ledger 的对应 = stock_ledger.issue_line_id 反向可空引用（**一行 0..N 流水**）；issue_line_id 在 ledger 上建索引。**允许一行多次过账、未过账中间态（0 条）合法**。
 
@@ -654,10 +669,12 @@ Index：(issued_at)、(subproject_id)。Lifecycle：append-only（作废走状�
 | substitution_reason | VARCHAR(255) | YES | | | | | 替代原因 |
 | weight / length / sheets | NUMERIC(12,3) | YES | | | | | **消耗重量（consumption 语义）/长度/张数（材料数量⑤）** |
 | cutting_result_line_id | BIGINT | YES | | | prod.cutting_result_line | | 来源切割结果行（Optional FK，关系 32） |
-| is_effective | BOOLEAN | NO | true | | | | 冲正置 false（保留行，更正域流程） |
+| is_effective | BOOLEAN | NO | true | | | | **冲正位（NB-2 收口）**：仅两种合法路径——①创建时 true；②冲正流程（更正域审批→reversal_record 新事实行落库）**同一事务内**由触发器白名单路径置 false。**禁止人工/接口直接 UPDATE 为 false**；除本列外全表列 append-only |
 | client_token / occurred_at / recorded_at / created_by | | | | | | | 幂等+事实标配（append-only） |
 
 Index：(source_batch_id)、(source_surplus_id)、(part_instance_id)、(occurred_at)。
+
+**NB-2 消耗冲正语义（最终收口）**：**不允许**把录错的消耗行 `is_effective` 直接手工改成 FALSE——录错消耗的合法处理路径 = 更正域（correction_request→approval→reversal_record）：冲正产生**新事实**（reversal_record + 原 stock_ledger 行的 correction_of_id 反向行），**同一事务内**经触发器白名单将原消耗行 `is_effective` 置 false；原消耗行及其余全部列**永久保留、永不改写**；重做=新消耗行（corrected 链经 reversal_record.redo_ref 关联）。效果：`(part_instance_id) WHERE is_effective` 部分唯一索引**在全流程中始终有效**（失效行退出唯一集，允许补录正确消耗）；冲正行永久留痕可审计。
 
 ### 7.10 whs.surplus_material（余料——**MCR-2/R27**）
 
@@ -732,9 +749,19 @@ Immutability：**make_type 任务创建后不可改**（约束 28：attempt 级�
 
 | 表 | 关键列 | Unique/约束 | 说明 |
 |---|---|---|---|
-| **production_report** | task_id FK 必填, actual_component_id FK 必填（冗余事实键）, route_template_step_id FK 必填（快照冗余）, operation_snapshot VARCHAR（报工时工序显示名快照）, execute_team_id FK（**班组快照**）, channel CHECK(scan/manual), report_seq INT, **client_token VARCHAR(64)**, occurred_at/recorded_at/created_by | **(task_id, report_seq)** ✔；**client_token 部分唯一**（0.6 模式——扫码重试防重） | 报工事实头（append-only；**单次作业事实 one work-event，非增量/最终申报**，RED-07） |
+| **production_report** | task_id FK 必填, actual_component_id FK 必填（冗余事实键）, route_template_step_id FK 必填（快照冗余）, operation_snapshot VARCHAR（报工时工序显示名快照）, execute_team_id FK（**班组快照**）, channel CHECK(scan/manual), **action_key VARCHAR(64)**, report_seq INT, **client_token VARCHAR(64)**, occurred_at/recorded_at/created_by | **(task_id, action_key)** ✔（**业务动作幂等键，NB-3 新增**）；report_seq 无唯一约束（显示序号）；**client_token 部分唯一**（0.6 模式——网络层重发防重） | 报工事实头（append-only；**单次作业事实 one work-event，非增量/最终申报**，RED-07） |
 | production_report_worker | report_id FK 必填, employee_id FK 必填, work_hours NUMERIC(6,2) 可空, 通用 | (report_id, employee_id) | **一人一行，至少一人**（CHECK count>=1 服务层；关系 45） |
 | production_measure | report_id FK 必填, measure_type CHECK(weight/cut_length/weld_length/mach_length/hours), value NUMERIC(12,3), unit_id FK → ref.unit_of_measure, 通用 | (report_id, measure_type) | **度量行≠件数；完成数量=COUNT(到件事实行)**（RED-07） |
+
+**NB-3 幂等身份与显示序号分离（最终收口）**：
+
+| 概念 | 载体 | 生成方 | 职责 |
+|---|---|---|---|
+| 网络层幂等 | `client_token`（部分唯一索引） | 扫码端每次 HTTP 请求生成 UUID | 同一请求重发（超时重试）拦截；重发返回首次结果 |
+| **业务动作幂等** | `(task_id, action_key)` UNIQUE（NB-3 新增） | 扫码端按**扫码动作**生成稳定标识（`terminal_id + 本地动作序号`，动作不重复提交则序号不重置） | **同一实际生产动作**即使换 token 重试也只落一行——换 token 不产生第二个有效报工 |
+| 显示/业务序号 | `report_seq`（无唯一约束） | **服务端**报工事务内按 task 维度 `max(report_seq)+1` 发放 | 仅列表展示/对账排序；**不承担幂等职责** |
+
+换 token 场景推演：第一次提交 token=A 超时（未落库/已落库）→ 客户端换 token=B 重试 → action_key 不变 → 若首次已落库则 `(task_id, action_key)` 唯一冲突 → 服务端按动作键反查首次行原样返回；若首次未落库则本次正常落库。**任何序列下同一动作至多一行有效报工**；report_seq 由服务端发放故永不冲突、永不重号（同 task 内）。
 
 ### 8.5 套料与切割五表（紧凑——计划层与作业层分离，RED-04）
 
@@ -758,11 +785,13 @@ Immutability：**make_type 任务创建后不可改**（约束 28：attempt 级�
 | inspection_type_id | BIGINT | NO | | | ref.inspection_type | ✔(见上) | |
 | attempt | INT | NO | 1 | | | ✔(见上) | 与对应工序任务 attempt 同源递增（RED-08） |
 | inspection_status | enum_inspection | NO | 'registered' | | | | registered/inspecting/concluded（10.4 检验单自身流转） |
-| conclusion | CHECK(pass/fail) | YES | | | | | 结论（出结论后**只允许更正流程修正，禁止改判覆盖**） |
+| conclusion | CHECK(pass/fail) | YES | | | | | 结论（**NB-2 收口：一次置值列——NULL→值仅允许发生一次（触发器拦截：已非 NULL 则禁 UPDATE/禁清空）；历史结论永久保留**；修正见下方替代关系） |
 | inspector_id | BIGINT | NO | | | md.user_account | | 检验员 |
 | occurred_at / recorded_at / created_by | | NO | | | | | 事实标配 |
 
-Lifecycle：**append-only**；复检=新行 attempt+1。Index：(actual_component_id, attempt)、(conclusion, occurred_at)。
+Lifecycle：**append-only**（窄路径白名单仅两列：`inspection_status` 流转 registered→inspecting→concluded、`conclusion` 一次置值——均由触发器白名单放行，NB-4/触发器清单 T-9）；复检=新行 attempt+1。Index：(actual_component_id, attempt)、(conclusion, occurred_at)。
+
+**NB-2 结论修正语义（最终收口）**：**历史检验结论永久保留，不改判不覆盖**。质检结论发生修正时的表达 = **复检新行替代**：修正/复检走 `attempt+1` 新检验行（唯一键 `(actual_component_id, inspection_type_id, attempt)` 天然容纳），新旧行的替代/纠正关系经**更正域留痕**（correction_request.source_ref 指向原检验行 → reversal_record.original_ref=原行、redo_ref=新 attempt 行）——替代关系可追溯，原行 conclusion/缺陷/检验员全部原样保留。**禁止**通过 UPDATE 旧行 conclusion 表达修正（触发器拦截）。
 
 ### 9.2 质量伴生四表（紧凑）
 
@@ -863,7 +892,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | **shipment_snapshot** | id, shipment_id FK 必填, actual_component_id FK 必填, component_no_snapshot, weight_snapshot, subproject_snapshot, pallet_no_snapshot, container_no_snapshot, qr_code_snapshot, snapshotted_at | **(shipment_id, actual_component_id)** ✔ | **确认时刻逐构件一行，全部冗余冻结副本（非活外键回写）**；confirmed 后**无更新路径**（仅查询；库账号回收 UPDATE——约束 8/不变量 8） |
 | shipment_event | shipment_id FK 必填, event_type CHECK(confirm/depart/transit_node/arrive/sign/return/reship), event_payload JSONB, occurred_at/recorded_at, 通用 | — | 状态事件（append-only；补发=新 shipment 行） |
 | transport_status_ext | shipment_id FK 必填, vehicle_or_vessel, current_location, external_ref, updated_at | (shipment_id) ✔ | **V1 预留位**（外部物流接口位；可空字段全预留） |
-| site_delivery_record | shipment_id FK 可空, component_ref（经快照）, signed_by_name, signed_at, diff_remark, client_token, 通用 | — | 现场签收（V1 轻量；退运补发可多次；append-only） |
+| site_delivery_record | shipment_id FK 可空, **actual_component_id BIGINT NOT NULL FK → prod.actual_component（ON DELETE RESTRICT）——NB-6 收口：签收目标类型单一（构件），不用软引用、不经快照间接**， signed_by_name, signed_at, diff_remark, client_token, 通用 | — | 现场签收（V1 轻量；退运补发可多次；append-only）。Index：**(actual_component_id, signed_at)（NB-6 新增）**；shipment_id 可空 FK 自带索引诉求由该复合索引前缀不覆盖——另建 (shipment_id) 单列索引（16.2 同步） |
 
 ---
 
@@ -882,7 +911,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | I-9 | material_consumption 是唯一实际消耗 | 独立消耗事实表；`part_instance_id` 有效消耗部分唯一（防一料多记）；`source_kind` 判别+双列条件 CHECK 多态来源（R2-01，7.9） | DB |
 | I-10 | reservation 不产生 stock ledger | `material_reservation` 状态机旁路 released/cancelled；表上**无写账路径**；可用量=余额−Σ活跃预留（服务层口径，MCR-5，7.8） | S（结构佐证） |
 | I-11 | purchase_receipt = 到货车次 | `receipt_no` 一次到货一张=一个车次 + `trip_no`/`vehicle_plate` 车次信息列；一 PO 多车次（receipt.purchase_order_id 可空 FK）、一车次多明细（R61，7.2） | DB |
-| I-12 | 到货预告不能改变库存 | 微信群等预告**链外不建实体**；receipt 登记本身不产生 ledger/balance/batch/consumption；**批次生成唯一入口 = purchase_receipt_item 验收事务**（约束 32，7.2/7.3） | S |
+| I-12 | 到货预告不能改变库存 | 微信群等预告**链外不建实体**；receipt 登记本身不产生 ledger/balance/batch/consumption；**批次默认唯一入口 = purchase_receipt_item 验收事务**；例外入口仅 `material_batch.batch_source ∈ {opening, manual}` 且强制 source_ref+审批留痕（约束 32 修订表述+NB-5，6.1/7.2/7.3） | S+DB(CHECK) |
 | I-13 | source_identity ≠ row_number | `import_row (import_batch_id, source_identity)` 唯一幂等；`source_row_number` 仅定位**不参与唯一**；`content_fingerprint` 仅判内容变化（MCR-4，5.2） | DB |
 | I-14 | 发运 snapshot immutable | `shipment_snapshot` 全列冻结副本（非活外键回写）；confirmed 后无更新路径+库账号回收 UPDATE（约束 8，11.7） | DB+S |
 
@@ -905,11 +934,11 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 9 | S(+DB) | `mixed_load_authorization` 表+`container_load_history.mixed_load_auth_id` 可空 FK；装载事务校验主项目一致性或有效授权（11.5） |
 | 10 | S | 装载事务内聚合 `pallet_weight_record`/`container_weight_record` 与 `max_weight` 比对，超限整体回滚；DB 触发器兜底 Phase 3 评估（11.1~11.5） |
 | 11 | DB+S | 事实表 append-only（0.4 统一约定）+更正/冲正域（10.3）；业务账号回收 UPDATE/DELETE 权限 |
-| 12 | DB+S | `client_token` 部分唯一索引（0.6 模式）；终端超时重试同 token 返回首结果（8.4/7.9/11.8） |
+| 12 | DB+S | `client_token` 部分唯一索引（0.6 模式）；**报工另有 `(task_id, action_key)` 业务动作唯一键（NB-3）**；终端超时重试同 token/换 token 均返回首结果（8.4/7.9/11.8） |
 | 13 | DB | `UNIQUE (subproject_id, component_no)`（5.6） |
 | 14 | DB+S | 唯一约束含报废占号；发号服务只增不回退（5.7/5.9） |
 | 15 | DB | `pallet_load (actual_component_id) 部分唯一 WHERE is_current`（11.2） |
-| 16 | DB | `material_consumption (part_instance_id) 部分唯一 WHERE is_effective`（7.9） |
+| 16 | DB | `material_consumption (part_instance_id) 部分唯一 WHERE is_effective`（7.9）；**is_effective 仅冲正事务内触发器白名单可置 false（NB-2）** |
 | 17 | S(+DB) | `part_instance` 锁定模板行（`bom_template_line_id` FK+`origin_part_no` 快照）；模板改版只影响未实例化部分（5.8/4.3） |
 | 18 | S+配置 | `ref.system_config` 开关（预警默认/硬拦截可配）；DB 不做不可逆结构（2.9） |
 | 19 | DB | `production_plan_line` 双 FK NOT NULL（actual_component_id+route_template_step_id）+三列唯一（8.1） |
@@ -925,11 +954,32 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 29 | DB+S | `(import_batch_id, source_identity)` UNIQUE；`source_row_number` 不参与唯一；`content_fingerprint` 判修改行；`corrected_from_row_id` 纠正链（5.2） |
 | 30 | DB+S | 领料单据/明细与 `stock_ledger` 分表；`ledger.issue_line_id` 反向可空；ledger 无单头语义列（7.5~7.7） |
 | 31 | S | `material_reservation` 无写账路径；状态机旁路；可用量服务层口径（7.8） |
-| 32 | S | 到货预告链外不建实体；receipt 登记不产生任何库存事实；批次生成唯一入口=验收事务（7.2/7.3） |
+| 32 | S+DB(CHECK) | 到货预告链外不建实体；receipt 登记不产生任何库存事实；**批次默认唯一入口=验收事务；例外入口仅 `batch_source ∈ {opening, manual}` 且 CHECK 强制 source_ref+approved_by/approved_at 非空（审批留痕另经 approval_record/operation_log）（NB-5 修订，6.1/7.2/7.3）** |
 | 33 | DB | `material.material_code` UNIQUE 全局+触发器禁改；name+spec 无唯一；`supplier_material_code` 可空可重复（3.8） |
 | 34 | RULE | 不建批次内逐块/逐根子单元表；细化追溯预留扩展位（模型 22.9）——本轮无物理结构 |
 
-**结论：34/34 全部有明确落点**；其中 6 条（10/18/25/31/32/34）为 S/配置层保证，数据库侧以"结构上无违规路径"佐证，不做伪 CHECK。
+**结论：34/34 全部有明确落点**；其中 5 条（10/18/25/31/34）为 S/配置层保证，32 收口后升级为 S+DB(CHECK)（NB-5），数据库侧以"结构上无违规路径"佐证，不做伪 CHECK。
+
+### 13.1 触发器设计清单（NB-4 收口——设计定义，**本轮不写 Trigger SQL**，Phase 3 Migration 实现）
+
+> 每项给出：触发时机/事件/阻止什么/事务边界/**强制层归属**。**强制层归属判定原则**：核心历史不可变（一旦被绕过即伪造历史）必须数据库强制（BEFORE 触发器 RAISE EXCEPTION）；业务规则校验类以应用层为主、DB 兜底可选。**无一项留"Phase 3 再看"**。
+
+| 编号 | Constraint/来源 | 目标表 | Trigger 目的 | BEFORE/AFTER | 事件 | 阻止什么 | 事务边界 | 强制层 |
+|---|---|---|---|---|---|---|---|---|
+| T-1 | 约束 8 / I-14 | ship.shipment_snapshot | 快照冻结 | **BEFORE** | UPDATE, DELETE | confirmed 后快照行任何 UPDATE/DELETE | 快照生成事务之后永久只读 | **必须 DB**（历史不可变核心）+权限回收双保险 |
+| T-2 | 约束 22 / I-3 | prod.actual_component | 替代指向态校验 | **BEFORE** | INSERT, UPDATE (OF replacement_for) | 新行 replacement_for 指向非 {scrapped, cancelled} 实例 | 实例化/补件事务内 | 应用层主校验 + **DB 兜底**（防绕过接口的直写） |
+| T-3 | 约束 22 / R2-03 | prod.part_instance | 替代指向态校验 | **BEFORE** | INSERT, UPDATE (OF replacement_of) | 指向非 substituted 实例；替代事实行 reason/replaced_at 缺失 | 替代事务内 | 应用层主校验 + **DB 兜底** |
+| T-4 | 约束 24 / I-4 | eng.bom_template_line | 模板行禁改 | **BEFORE** | UPDATE (OF 语义列) | 引用计数>0 后 part_no/part_name/material_desc/qty_per_component 变更；DELETE 一律阻止 | 语义列变更独立事务，禁改即回滚 | **必须 DB**（历史生产事实不漂移） |
+| T-5 | 约束 24 / I-4 | eng.route_template_step | 模板工序行禁改 | **BEFORE** | UPDATE (OF 语义列), DELETE | 被引用后 operation_type_id/default_requirement 变更、行删除 | 同 T-4 | **必须 DB** |
+| T-6 | 约束 28 / MCR-3 | prod.production_task | make_type 终局 | **BEFORE** | UPDATE (OF make_type) | 任务创建后 make_type 任何变更 | 任务事务（返工=新任务，无合法变更路径） | **必须 DB** +接口不开放 |
+| T-7 | 约束 33 / G-2 | md.material | material_code 禁改 | **BEFORE** | UPDATE (OF material_code) | 材料编码任何变更（含大小写/空格变体） | 主数据事务（更正=新码新行，无合法变更路径） | **必须 DB** |
+| T-8 | 约束 29 / MCR-4 | imp.import_row | 处理后整行冻结 | **BEFORE** | UPDATE, DELETE | 批次处理事务提交后（result_status 已定值）任何列变更/行删除 | 导入批次处理事务边界为准 | **必须 DB**（两批次原文留存） |
+| T-9 | NB-2 | prod.quality_inspection | conclusion 一次置值 + 白名单 | **BEFORE** | UPDATE (OF conclusion, inspection_status) | ①conclusion 已非 NULL 后再改/清空；②白名单外列变更 | 检验出结论事务 | **必须 DB**（历史结论保留） |
+| T-10 | NB-2 | whs.material_consumption | is_effective 仅冲正路径 | **BEFORE** | UPDATE (OF is_effective) | 非冲正事务上下文（无同事务 reversal_record 落库标记）将 true→false；false→true 一律阻止；其余列 UPDATE 一律阻止 | 冲正事务：reversal_record+反向 ledger 行+本列翻转**同事务** | **必须 DB**（防偷改历史） |
+| T-11 | NB-2 | whs.material_issue_line | issued_qty 聚合白名单 | **BEFORE** | UPDATE (OF issued_qty) | 白名单外列变更；issued_qty 与流水聚合偏离超容差 | 过账/对账事务内刷新 | **必须 DB**（防手工放大实发数） |
+| T-12 | NB-8 | prod.component_list_item | voided 后语义列禁改 | **BEFORE** | UPDATE (OF 语义列), DELETE | row_status='voided' 后 name/quantity 等语义列变更、行删除 | 导入修正处置事务（仅 row_status 单向 active→voided） | **必须 DB**（voided 行原值留存） |
+
+**应用层为主、不建触发器的项**：约束 25（deprecated 禁新引用——纯写入前校验）；约束 9/10（装载授权/超重——事务聚合）；约束 18（配置开关）；约束 31（预留不碰账——结构无路径+服务层口径）。全部已在各表节/13 章主表声明，无遗留。
 
 ---
 
@@ -967,7 +1017,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 14 | `whs.po_item_allocation.item_id` NOT NULL FK + `subproject_id` NOT NULL FK（公司级未分摊=0 行，N-4） | MF |
 | 15 | `whs.purchase_receipt.purchase_order_id` 可空 FK（一 PO 多车次；手工直购可空） | OF |
 | 16 | `whs.purchase_receipt_item.receipt_id` NOT NULL FK（一车次多明细） | MF |
-| 17 | `whs.material_batch.receipt_item_id` 可空 FK（验收生成入口；期初/手工批次可空） | OF |
+| 17 | `whs.material_batch.receipt_item_id` 可空 FK（验收生成入口；期初/手工批次可空——NB-5 收口：batch_source CHECK 收敛默认/例外入口，例外强制审批留痕） | OF |
 | 18 | `whs.material_batch_certificate (batch_id, cert_id)` 双列 PK junction（多批共用一质保书；缺失预警=S） | JCT |
 | 19 | `whs.material_batch.material_id` NOT NULL FK（内部 identity，G-2） | MF |
 | 20 | `whs.stock_balance.material_batch_id` NOT NULL FK（+storage_location 三维唯一） | MF |
@@ -1066,7 +1116,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 76 | shipment↔箱历史：`shipment_snapshot.container_no_snapshot` 冻结副本+`container_load_history`；**历史发运关系不可改**（无活跃 FK） | MAINT |
 | 77 | `ship.shipment_snapshot.shipment_id` NOT NULL FK + `actual_component_id` NOT NULL FK，`(shipment_id, actual_component_id)` 唯一（逐构件快照行） | MF |
 | 78 | `ship.shipment_event.shipment_id` NOT NULL FK | MF |
-| 79 | `ship.site_delivery_record` 经 `shipment_snapshot` 间接引用构件（component_ref；退运补发 0..N 次签收行） | SOFT(经快照) |
+| 79 | `ship.site_delivery_record.actual_component_id` NOT NULL FK→`prod.actual_component`（NB-6 收口：单类型强 FK，ON DELETE RESTRICT，不经快照间接）；shipment_id 可空 FK 保留 | MF(actual_component)+OF(shipment) |
 
 ### 4.11 人员/权限（80–85）
 
@@ -1101,7 +1151,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 101 | `whs.material_reservation.requirement_item_id` 可空 FK（空=手动预留） | OF |
 | 102 | `prod.production_task.supplier_id` 可空 FK+条件 CHECK（与约束 27 同落点；与 execute_team/worker 三分立） | OF |
 
-**结论：102/102 全部覆盖**——按行计：MF 65（其中 3 行为双 MF、4 行为 MF+OF/SOFT 复合）、OF 19、SOFT 9、JCT 1、SELF 5、MAINT 3。软引用全部为"结构化引用对（ref_type 受控 CHECK+ref_id）"，无一处 JSON 引用，且均建 `(ref_type, ref_id)` 组合索引。
+**结论：102/102 全部覆盖**——按行计：MF 66（其中 3 行为双 MF、5 行为 MF+OF 复合——含关系 79 经 NB-6 收口升级）、OF 19、SOFT 8、JCT 1、SELF 5、MAINT 3。软引用全部为"结构化引用对（ref_type 受控 CHECK+ref_id）"，无一处 JSON 引用，且均建 `(ref_type, ref_id)` 组合索引。
 
 ---
 
@@ -1165,7 +1215,9 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | material(material_code)（唯一承载）、(management_class) | 材料定位、按管理分类库存视图 |
 | purchase_receipt(purchase_order_id)、(arrived_at)、(trip_no) | 一 PO 多车次查询（场景 I） |
 | stock_ledger(material_batch_id, occurred_at)、(surplus_id)、(issue_line_id)、(movement_type, occurred_at) | 批次账本、余料账、单据行反查流水（G-1）、八类动作统计 |
+| **stock_balance(storage_location_id, material_batch_id)（NB-7 新增）** | 仓库查询路径：库位→现存批次/材料（现场盘点、库位库存视图）；扣减事务主路径仍走唯一索引 (material_batch_id, storage_location_id) 前缀 |
 | material_issue_line(material_batch_id)、material_issue_document(issued_at, subproject_id) | 按批次反查领料来源、领料单查询 |
+| **site_delivery_record(actual_component_id, signed_at)（NB-6 新增）+ (shipment_id)** | 构件签收履历、按车次/发运反查签收 |
 | material_reservation(material_batch_id, status)、(material_id, status)、(requirement_item_id) | 可用量计算（余额−Σ活跃预留）、需求预留视图 |
 | surplus_material(source_batch_id)、(parent_surplus_id)、(status) | 余料血缘双向追溯（场景 E） |
 
@@ -1190,7 +1242,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 
 | 表 | 幂等键 | 业务兜底 |
 |---|---|---|
-| production_report | client_token 部分唯一 | (task_id, report_seq) 唯一 |
+| production_report | client_token 部分唯一 | **(task_id, action_key) 唯一（NB-3 业务动作幂等）**；report_seq 无唯一约束（显示序号，服务端发放） |
 | material_consumption | client_token 部分唯一 | (part_instance_id) WHERE is_effective 唯一 |
 | site_delivery_record | client_token 部分唯一 | （多次签收合法，无业务兜底键） |
 
@@ -1198,10 +1250,10 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 
 同一扫码动作重复提交的行为契约：
 
-1. **生产确认**：终端超时重试携带同一 client_token ⇒ 部分唯一索引拦截第二行 ⇒ 服务端捕获冲突后**查询首次落库结果原样返回**（幂等响应，非报错）。`production_report` 永不出现两行同动作 ⇒ 完成数量=COUNT(事实行) 天然不重复（RED-07）。
+1. **生产确认**：终端超时重试携带同一 client_token ⇒ 部分唯一索引拦截第二行 ⇒ 服务端捕获冲突后**查询首次落库结果原样返回**（幂等响应，非报错）。**换 token 重试场景（NB-3）**：action_key 随动作不变 ⇒ `(task_id, action_key)` 唯一兜底拦截，服务端按动作键反查首次行原样返回 ⇒ 永不产生两行同动作报工 ⇒ 完成数量=COUNT(事实行) 天然不重复（RED-07）。
 2. **材料消耗**：`material_consumption.client_token` 同模式 ⇒ 不会重复消耗；有效消耗唯一约束兜底防一料多记。
 3. **库存过账**：stock_ledger 行由服务端动作在 consumption/issue 确认事务内一次生成；上层幂等截停后重试不会重复触达过账。
-4. **领料实发**：`issue_line.issued_qty` 为流水聚合可重建值，重复过账行即使发生也会在聚合对账中暴露（双保险）。
+4. **领料实发**：`issue_line.issued_qty` 为流水聚合可重建值（T-11 白名单列），重复过账行即使发生也会在聚合对账中暴露（双保险）。
 
 ### 17.4 事务隔离与行锁
 
@@ -1224,37 +1276,160 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 
 ---
 
-## 18. 历史事实分类（append-only / 可 update / 事实后 immutable）
+## 18. 物理表生命周期分类主清单（NB-1 收口：131 表逐张归类，权威清单）
 
-### 18.1 T1 纯 append-only（业务账号回收 UPDATE/DELETE，Phase 3 Migration 建权）
+> 本清单为全库 **131 张物理表逐张归类**的权威清单（替代原 T1/T2/T3 不完整清单——原清单遗漏约 24 表，NB-1 收口）。**Phase 3 Migration 建权（revoke UPDATE/DELETE）以本清单为准**，并与各表节 Lifecycle 声明一致。
+>
+> **分类定义**：
+> - **A｜正常可更新主数据/当前状态表**：承载业务对象"当前值"，允许 UPDATE；关键列"事实后不可变"逐列受限（18.9）；状态迁移留痕要求逐表注明；删除=软删除/状态位。
+> - **B｜Append-only 业务事实表**：业务事实行，INSERT 后整行不可改写（**窄路径白名单列**逐表注明——NB-2 收口，白名单外 UPDATE 由 T-8/T-9/T-10/T-11/T-12 触发器拦截）；业务账号回收 UPDATE/DELETE 权限；更正/冲正一律走更正域（10.3）。
+> - **C｜配置/字典表**：业务可维护；停用=is_active/deprecated 标记；code_rule.seq_current 允许发号推进（FOR UPDATE 短事务）。
+> - **D｜事件/审计/导入历史表**：append-only 事件流/审计留痕，**严禁任何 UPDATE/DELETE**。
+>
+> **全库统一 DELETE 策略（⑥，适用于全部 131 表）**：**严禁物理 DELETE**——C 类停用走 is_active 标记；其余表 DELETE 权限一律回收（Phase 3 Migration 建权）；核心事实外键全 RESTRICT（无 ON DELETE CASCADE），历史链（批次链/血缘链/纠正链/替代链）永不删除。
+>
+> **分类统计：A=57 ｜ B=48 ｜ C=14 ｜ D=12 ｜ 合计 131**。
+>
+> 列说明：①允许 UPDATE 的字段；②事实形成后不可 UPDATE 的字段；③是否允许状态推进；④状态推进是否必须追加事件行；⑤void/停用限定（未注明=不适用）。
 
-`project_status_history`、`actual_component_event`、`component_scrap_record`、`label_print_history`、`production_plan_version`、`plan_adjustment`、`task_cancellation`、**`production_report` / `production_report_worker` / `production_measure`（用户点名）**、`cutting_record`、`cutting_result_line`、**`quality_inspection` / `quality_defect` / `final_qualification`（用户点名"quality result"）**、`weighing_record`、`weight_discrepancy`、`purchase_receipt`、`purchase_receipt_item`、**`stock_ledger`**、`material_issue_line`、**`material_consumption`（用户点名）**、`scrap_record`、`finished_goods_event`、`equipment_event`、`equipment_impact`、`exception_impact`、`exception_handling`、`correction_approval`、`correction_entry`、`reversal_record`、`approval_record`、`operation_log`、`pallet_load_history`、`container_load_history`、`pallet_weight_record`、`container_weight_record`、**`shipment_snapshot`（用户点名"shipment"）**、`shipment_event`、`site_delivery_record`、`material_batch_certificate`、`component_list_item_feature`。
+### 18.1 ref schema（13 表——全 C 类）
 
-### 18.2 T3 事实行+状态位可变（仅状态/结论位允许 UPDATE，其余列 append-only）
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| operation_type, inspection_type, exception_category, component_type_dict, component_feature_dict, subproject_type, reason_dictionary, unit_of_measure, acceptance_result（9 表） | C | code 外描述列（name/description/sort_no） | code 创建后不可变（全库引用锚点） | — | — | is_active=false 停用（历史引用不受影响） |
+| component_type_mapping, qr_scan_access（2 表） | C | 映射/策略配置列 | — | — | 变更写 operation_log（建议） | is_active=false |
+| code_rule | C | **seq_current（发号推进）** | 编码前缀/格式定义 | — | — | 已发号规则禁停用 |
+| system_config | C | config_value | config_key | — | 变更写 operation_log（建议） | — |
 
-`production_task`（status/actual_start/actual_end）、`part_instance`（status+替代事实一次性置值）、`actual_component`（双状态位+可重建列）、`material_reservation`（status/consumed_by_ledger_id）、`ncr`（status/closed_at）、`shipment`（**draft 阶段可编辑；confirmed 后整行转 T1**）、`material_issue_document`（status 位）、`inventory_check`（status）、`exception_event`（status/closed_*）、`correction_request`（status）、`equipment`（status）、`pallet`/`shipping_container`（status/当前归属列）、`finished_goods_stock`（status）、`material_requirement`（status）、`purchase_order`（status）、`notification_delivery`（status/read_at）、`nesting_batch`（作废位）。
+### 18.2 md schema（18 表——全 A 类）
 
-### 18.3 T2 允许正常 update（A 类当前状态行/配置/缓存）
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| main_project, subproject | A | 属性列+status | project_code；生命周期经历史表留痕 | 八态状态机 | **是（aud.project_status_history）** | closed 后可重开（reopened_reason 必填） |
+| employee, team, user_account | A | 档案/账号列 | employee_code/team_code | — | — | is_active=false |
+| team_membership, secondment_record, team_leader_history | A | 归属/任职区间列（end_date/is_current） | start/appointed 事实时刻 | — | 变更写 operation_log（建议） | — |
+| role, permission, role_permission, user_role | A | 授权关系维护 | role_key/permission_key | — | 变更写 operation_log | is_active=false |
+| data_scope_policy, segregation_rule | A | 范围/规则配置列 | — | — | 变更写 operation_log | enabled=false |
+| material | A | 属性列（name/grade/specification 等，变更留痕） | **material_code 永不可改（T-7）** | — | 属性变更写 operation_log（建议） | is_active=false（编码永不复用） |
+| supplier | A | 档案列 | 身份列 | — | — | is_active=false |
+| warehouse, storage_location | A | 名称/属性列 | 编码列 | — | — | is_active=false |
 
-`main_project`/`subproject`（current_status 位）、`employee`/`team`/`team_membership`/`secondment_record`/`team_leader_history`、`material`（除 18.4 不可变列）、`supplier`、`warehouse`/`storage_location`、RBAC 七表、`ref` 字典全部（软删除停用）、`code_rule`（seq_current 发号推进）、`system_config`、`stock_balance`（流水重建的缓存余额）、`plan_progress_snapshot`（计算缓存可全量重算）、`transport_status_ext`（外部物流状态位）。
+### 18.3 eng schema（11 表）
 
-### 18.4 事实后 immutable 字段清单（更正走更正域，禁止原地改）
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| engineering_object, drawing | A | 属性列 | ext_object_key/drawing_no | — | — | is_active=false |
+| engineering_binding | A | 绑定指向变更（=旧解绑+新绑定，不覆盖） | — | — | 变更写 operation_log | 旧绑定停用不删 |
+| component_bom_template | A | is_effective 版次切换 | 模板身份 | — | 切换写 operation_log（建议） | — |
+| bom_template_line | A | **仅 line_status（active→deprecated 单向）** | **被引用后语义列禁改（T-4）**；新内容=新行新 line_no | 单向 deprecated | deprecate 动作写 operation_log（建议） | deprecated（禁新引用，行保留） |
+| route_template | A | is_default/适用范围 | — | — | — | — |
+| route_template_step | A | **仅 step_status（单向）** | **被引用后语义列禁改（T-5）** | 单向 deprecated | 同上 | deprecated |
+| drawing_revision | B | **仅 is_effective 切换留史** | 版次内容/file_ref | — | 切换写 operation_log | — |
+| engineering_change, engineering_change_item, change_disposition | B | — | 全列（变更/处置事实） | — | — | — |
+
+### 18.4 imp schema（5 表）
+
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| component_list_import_batch | B | **批次处理事务内 batch_status/统计列一次落定**；提交后冻结 | 批次身份/链列（supersedes_batch_id） | 处理事务内推进 | — | — |
+| import_row | B | **批次处理事务内 result_status/target 一次落定**；提交后整行冻结（**T-8**） | raw_payload/identity/corrected 链全列 | — | — | — |
+| import_correction_result | B | **decided_by/at+计数列在决策事务内一次落定** | 净效果计数事实 | conflict/invalidated 人工决策 | 决策经 approval_record | — |
+| import_field_mapping | C | 映射列 | version_no 冻结 | — | — | is_active=false（旧版本停用不删） |
+| nesting_import_batch | B | — | 全列 | — | — | — |
+
+### 18.5 prod schema（34 表）
+
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| component_list_item | A | 更正域批准的更正列（留痕）+**row_status（active→voided 单向，T-12）** | theoretical_weight/total_weight_declared/quantity（导入事实） | voided 处置 | **是（处置经 approval_record+operation_log）** | voided（禁删禁改语义列；NB-8） |
+| actual_component | A | production_status/quality_status（双独立状态机）+可重建列（current_*/actual_weight） | id/instance_sequence/component_no/replacement_for/qr_code_id | 允许 | **是（actual_component_event）** | scrapped=终态（scrap_record 事实+批准；号不复用） |
+| part_instance | A | status+替代事实一次性置值（replacement_of/reason/replaced_at） | bom_template_line_id/origin_part_no/instance_sequence | 允许 | **是（替代=事实行；状态迁移随件事件）** | substituted/scrapped=事实行表达 |
+| qr_code_registry | A | **status（active→voided 单向）+printed_count 递增** | qr_code（码-件 1:1 终身绑定） | — | 补打写 label_print_history | voided（码永不复用） |
+| production_plan | A | status（draft→approved→frozen） | 计划身份 | 允许 | 迁移写 operation_log（建议） | — |
+| production_plan_line | A | **版本 frozen 前行可编辑；frozen 后整行冻结** | frozen 后全列 | — | — | — |
+| production_task | A | status/actual_start/actual_end | **make_type/supplier_id（T-6）**/身份三元组/rework_of_task_id | 允许 | **是（task_event；取消另写 task_cancellation）** | cancelled=事实行保留 |
+| primary_team_assignment | A | is_current 切换 | 历史 assignment 行事实 | — | **是（primary_team_change_history）** | — |
+| nesting_batch | A | **作废位（void 单向）** | 计划身份 | — | 作废写 operation_log | void |
+| ncr | A | status/closed_at/disposition_summary | ncr_no/归一关系 | 允许 | 关闭写 operation_log（建议） | — |
+| equipment | A | status | equipment_code | 允许 | **是（equipment_event from/to_status）** | — |
+| actual_component_event, task_event, label_print_history, primary_team_change_history, equipment_event（5 表） | D | — | 全列（严禁 UPDATE/DELETE） | — | — | — |
+| component_scrap_record, plan_adjustment, task_participant, task_cancellation, production_report, production_report_worker, production_measure, nesting_detail, cutting_record, cutting_result_line, nesting_drawing_file, quality_defect, rework_order, equipment_impact, component_list_item_feature（15 表） | B | — | **全列 append-only**（production_report 含 NB-3 action_key：落行后不可变，重试=动作键唯一拦截而非 UPDATE） | — | — | — |
+| quality_inspection | B | **窄路径白名单仅两列：inspection_status 流转+conclusion 一次置值（T-9）** | 其余全列；**conclusion 一经置值永久保留** | registered→inspecting→concluded | 修正=attempt+1 新行（替代关系经更正域留痕） | — |
+| final_qualification | B | **仅 revoke 标记一次性置值（撤销经更正域）** | is_qualified/released 事实列 | — | 撤销经 reversal_record | revoked（历史保留） |
+| production_plan_version | B | — | 全列（版本只追加，下发后冻结 RED-12） | — | — | — |
+
+### 18.6 whs schema（23 表）
+
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| purchase_order | A | status（draft→confirmed→closed）；**draft 阶段单头列可编辑，confirmed 后冻结** | confirmed 后语义列 | 允许 | 迁移写 operation_log（建议） | — |
+| purchase_order_item, po_item_allocation | A | **draft 阶段可编辑；confirmed 后整行冻结** | confirmed 后全列 | — | — | — |
+| purchase_receipt | B | — | 全列（车次事实） | — | — | — |
+| purchase_receipt_item | B | **acceptance_result_id/accepted_* 验收事务内一次置值** | 其余全列 | 未验收→结论（单向） | — | — |
+| material_batch | B | — | **全列（批次身份/快照/创建入口列落定后不可变——NB-5）** | — | 例外入口创建经 approval_record+operation_log（NB-5） | — |
+| material_certificate | A | file_ref/remark 更正（留痕） | cert_no | — | — | — |
+| material_requirement | A | status（open/closed） | 需求身份 | 允许 | — | — |
+| material_requirement_item | B | — | 全列（每批次需求快照） | — | — | — |
+| weighing_record, weight_discrepancy | B | — | 全列（过磅/磅差事实；settlement_basis 落定后不可变） | — | — | — |
+| material_consumption | B | **窄路径白名单仅 is_effective：冲正事务内经 T-10 置 false** | **其余全列永久保留（消耗事实）** | — | 冲正=reversal_record+反向 ledger 行**同事务** | — |
+| surplus_material | A | status+in_public_pool | source_batch_id/parent_surplus_id/weight/身份快照（I-5 血缘锚点） | 允许 | **是（出池/降级写事件行，RED-06）** | scrapped=事实行表达 |
+| scrap_record | B | — | 全列 | — | — | — |
+| stock_balance | A | 余额列/length_total/pieces/sheets/version（**缓存可重建**） | —（非事实源） | — | 每次变更同事务由 stock_ledger 行承载 | — |
+| stock_ledger | B | — | **全列 append-only**（冲正=correction_of_id 反向行，非 UPDATE） | — | — | — |
+| inventory_check | A | status | check_no/盘点事实 | 允许 | **是（差异调整写 stock_ledger 调整行）** | — |
+| material_issue_document | B | **仅 status 位（draft→confirmed→voided，void 单向）** | 其余全列（单据事实） | void 处置 | 作废写 operation_log | voided |
+| material_issue_line | B | **窄路径白名单仅 issued_qty：聚合重建（T-11）** | 其余全列（含 requested_qty） | — | 过账事实=stock_ledger 行（0..N） | — |
+| material_reservation | A | status/consumed_by_ledger_id（version CAS） | reservation_no/reserved_weight（改预留=release+新预留） | 允许 | **是（迁移留痕经 operation_log，15 章决策）** | released/cancelled |
+| finished_goods_stock | A | status+storage_location_id | 成品身份（出库后行保留） | 允许 | **是（finished_goods_event）** | — |
+| finished_goods_event | D | — | 全列 | — | — | — |
+| material_batch_certificate | B | — | 全列（关联事实） | — | — | — |
+
+### 18.7 ship schema（14 表）
+
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| pallet | A | status/当前归属列 | pallet_no/max_weight | 允许 | **是（pallet_load_history load/remove/repack）** | — |
+| pallet_load | A | is_current 切换 | — | — | **是（pallet_load_history）** | — |
+| shipping_container | A | status/当前归属列 | container_no/max_weight/volume | 允许 | **是（container_load_history）** | — |
+| container_load | A | is_current 切换 | — | — | **是（container_load_history）** | — |
+| mixed_load_authorization | A | valid_until 生效管理 | auth_no/授权事实 | — | — | 过期=事实保留 |
+| shipment | A | **draft 阶段可编辑；confirmed 后整行冻结（仅 status 状态机推进）** | confirmed 后全列 | 允许 | **是（shipment_event）** | — |
+| transport_status_ext | A | 外部状态缓存列（可覆盖刷新） | — | — | — | — |
+| pallet_weight_record, container_weight_record, shipment_snapshot, site_delivery_record（4 表） | B | — | **全列 append-only**（shipment_snapshot=T-1 永久冻结；site_delivery 退运补发=追加新行） | — | — | — |
+| pallet_load_history, container_load_history, shipment_event（3 表） | D | — | 全列（严禁 UPDATE/DELETE） | — | — | — |
+
+### 18.8 aud schema（13 表）
+
+| 表 | 类 | ①允许 UPDATE | ②事实后不可变 | ③状态推进 | ④推进须追加事件 | ⑤void/停用 |
+|---|---|---|---|---|---|---|
+| exception_event | A | status/closed_* | 异常身份/来源引用/occurred_at | 允许 | **是（exception_handling）** | — |
+| exception_impact, exception_handling | B | — | 全列 | — | — | — |
+| correction_request | A | status（状态机）/决策信息 | request_no/来源引用/申请事实 | 允许 | **是（correction_approval 链+reversal_record）** | rejected=事实保留 |
+| correction_approval, correction_entry, reversal_record, approval_record（4 表） | B | — | 全列（更正/审批事实） | — | — | — |
+| notification_delivery | A | status/read_at（仅收件人推进） | — | 允许 | — | — |
+| project_status_history, operation_log, notification_message（3 表） | D | — | 全列（严禁 UPDATE/DELETE） | — | — | — |
+| plan_progress_snapshot | A | 计算缓存列（可全量重算覆盖） | —（非事实源） | — | — | — |
+
+### 18.9 事实后 immutable 字段清单（更正走更正域，禁止原地改）
 
 | 表.列 | 规则 |
 |---|---|
-| material.material_code | 触发器禁 UPDATE（G-2/N-1） |
-| component_list_item.theoretical_weight / total_weight_declared / quantity | 导入事实原值；修正版走 G 场景流程 |
-| bom_template_line / route_template_step 业务语义列 | 被 part_instance/plan_line/task 引用后触发器禁 UPDATE（MCR-1） |
-| production_task.make_type / supplier_id / 身份三元组 | 任务创建后不可改（MCR-3） |
+| material.material_code | 触发器 T-7 禁 UPDATE（G-2/N-1） |
+| component_list_item.theoretical_weight / total_weight_declared / quantity | 导入事实原值；修正版走 G 场景（NB-8：人工批准后整行 voided，**不改原值**） |
+| bom_template_line / route_template_step 业务语义列 | 被引用后触发器 T-4/T-5 禁 UPDATE（MCR-1） |
+| production_task.make_type / supplier_id / 身份三元组 | 任务创建后不可改（T-6/MCR-3） |
 | actual_component.id / instance_sequence / component_no / replacement_for | 事实后不可变 |
-| **import_row 整行**（用户点名） | result_status/target 引用在**批次处理事务内一次落定**，处理后整行冻结（Phase 3 触发器/权限兜底） |
-| quality_inspection.conclusion | 出具后禁改判覆盖（约束 7） |
+| **import_row 整行**（用户点名） | result_status/target 引用在**批次处理事务内一次落定**，处理后整行冻结（T-8） |
+| quality_inspection.conclusion | **一次置值（T-9）**：NULL→值仅一次，历史结论永久保留；修正=attempt+1 新行替代（NB-2） |
 | weighing_record / stock_ledger 全列 | 原始事实，冲正走 correction_of_id 反向行 |
-| material_consumption 事实列 | 冲正=is_effective 置 false（保留行） |
+| material_consumption 事实列 | **仅 is_effective 经冲正事务 T-10 置 false；其余列永久保留**（NB-2） |
 | purchase_receipt_item.acceptance_result_id / accepted_* | 验收结论一次置值，变更走更正域 |
-| material_issue_line.requested_qty | 申请量事实 |
+| material_issue_line | 除 issued_qty（T-11 聚合白名单）外全列事实（含 requested_qty） |
 | surplus_material.source_batch_id / parent_surplus_id | 血缘锚点不可变 |
-| shipment_snapshot 全列 | confirmed 后冻结（约束 8） |
+| shipment_snapshot 全列 | confirmed 后冻结（T-1/约束 8） |
+| **production_report 整行（含 action_key/client_token）** | append-only；NB-3 动作键落行后不可变，重试=唯一键拦截 |
+| **production_report_worker / production_measure 整行** | append-only |
+| **material_batch 全列** | 批次身份/快照/创建入口（batch_source/source_ref/approved_*）落定后不可变（NB-5） |
 
 ---
 
@@ -1265,7 +1440,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 ### 19.A 正常生产（quantity=9 → 9 构件 + 36 零件实例）
 
 - **涉及表**：imp.component_list_import_batch → imp.import_row → prod.component_list_item → eng.component_bom_template/bom_template_line → prod.actual_component → prod.part_instance → prod.production_plan(+version/line) → prod.production_task → prod.production_report(+worker/measure) → prod.quality_inspection → prod.final_qualification → whs.finished_goods_stock(+event)
-- **关键约束**：`(subproject_id, component_no)` 唯一；`(subproject_id, component_no, instance_sequence)` 唯一；actual_component 无 quantity 列；part_instance 三元组唯一；plan_line 三元组唯一；task 三元组唯一；report `(task_id, report_seq)` 唯一+client_token；finished_goods 部分唯一 WHERE in_stock
+- **关键约束**：`(subproject_id, component_no)` 唯一；`(subproject_id, component_no, instance_sequence)` 唯一；actual_component 无 quantity 列；part_instance 三元组唯一；plan_line 三元组唯一；task 三元组唯一；report **`(task_id, action_key)` 业务动作唯一（NB-3）**+client_token 网络幂等；finished_goods 部分唯一 WHERE in_stock
 - **预期结果**：清单 quantity=9 ⇒ 9 行 actual_component（sequence 1..9）；BOM 模板行 P1×4 ⇒ 每构件 4 行 part_instance（共 36）；完成件数=COUNT(状态∉{scrapped,cancelled})=9；需求恒=9；最终合格后成品入库 1 行/件
 
 ### 19.B 报废补做（AC05 报废 → AC11 补件）
@@ -1298,11 +1473,11 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 - **关键约束**：`make_type` NOT NULL；条件 CHECK（outsource⇒supplier_id 非空、inhouse⇒必空）；`execute_team_id` 单值；supplier 与 execute_team/worker 三分立禁共指（服务层）
 - **预期结果**：制造方式为**任务级**事实；同构件不同 step 可异构；任务创建后 make_type/supplier 不可改；attempt1 保留原值
 
-### 19.G Excel 修正版（corrected_resubmit）
+### 19.G Excel 修正版（corrected_resubmit，含 NB-8 失效推演：500→8 改/3 增/2 失效）
 
-- **涉及表**：imp.component_list_import_batch（import_kind='corrected_resubmit'、supersedes_batch_id）→ imp.import_row（同 source_identity 新行、corrected_from_row_id）→ imp.import_correction_result → prod.component_list_item / actual_component
-- **关键约束**：`(import_batch_id, source_identity)` 唯一；`CHECK (supersedes_batch_id 非空 ⇒ import_kind='corrected_resubmit')`；`source_row_number` 不参与唯一；conflict 人工决策；实例三元组幂等复用
-- **预期结果**：原批次/原行**不删除不覆盖**（新行新身份）；无生产事实构件自动更新；有生产事实构件 ⇒ conflict ⇒ 人工决策；同 source_identity 内容变化经 content_fingerprint 识别为 updated
+- **涉及表**：imp.component_list_import_batch（import_kind='corrected_resubmit'、supersedes_batch_id）→ imp.import_row（同 source_identity 新行、corrected_from_row_id；**2 失效行落 result_status='invalidated'**）→ imp.import_correction_result（**rows_invalidated=2**）→ prod.component_list_item（**人工批准后 row_status='voided'**）→ prod.actual_component
+- **关键约束**：`(import_batch_id, source_identity)` 唯一；`CHECK (supersedes_batch_id 非空 ⇒ import_kind='corrected_resubmit')`；`source_row_number` 不参与唯一；conflict/invalidated 人工决策；实例三元组幂等复用；**voided 行禁删禁改（T-12）**
+- **预期结果**：原批次/原行**不删除不覆盖**（新行新身份）；487 kept+8 updated+3 created 自动落行；**2 失效行落 invalidated 待处置 → 人工批准 → 目标 component_list_item 置 voided（原值原身份保留）**；若失效目标已实例化 ⇒ 拒绝处置转 conflict 人工路径；同 source_identity 内容变化经 content_fingerprint 识别为 updated
 
 ### 19.H 一单多行领料（一张单 5 种材料）
 
@@ -1319,7 +1494,7 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 ### 19.J 一车多 Heat（同车 5 种材料 2 合格 3 待处理）
 
 - **涉及表**：whs.purchase_receipt（1 行）+ purchase_receipt_item（5 行独立结论）→ material_batch（2 行，仅合格行）+ material_batch_certificate
-- **关键约束**：`(supplier_id, heat_no)` 组合唯一；**批次生成唯一入口=验收事务**；一车多 Heat 不归并
+- **关键约束**：`(supplier_id, heat_no)` 组合唯一；**批次默认唯一入口=验收事务（例外入口仅 batch_source∈{opening,manual}+审批，NB-5）**；一车多 Heat 不归并
 - **预期结果**：2 合格行生成 2 个 material_batch（不同 heat_no=不同批次行）；3 待处理行不生成批次（acceptance_result=NULL 中间态合法）；质保书经 junction 关联；车头不做任何 Heat 归并
 
 ---
@@ -1338,35 +1513,42 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 
 ### 20.2 Relation Coverage：102/102 ✅
 
-见第 14 章逐条映射（MF 65 / OF 19 / SOFT 9 / JCT 1 / SELF 5 / MAINT 3，含复合行）。无一条关系缺物理实现；多态关系全部为受控 ref_type+组合索引，无 JSON 引用。
+见第 14 章逐条映射（MF 66 / OF 19 / SOFT 8 / JCT 1 / SELF 5 / MAINT 3，含复合行；NB-6 收口后关系 79 由 SOFT(经快照) 升级为 MF(actual_component)+OF(shipment) 复合强引用）。无一条关系缺物理实现；多态关系全部为受控 ref_type+组合索引，无 JSON 引用。
 
 ### 20.3 Constraint Coverage：34/34 ✅
 
-见第 13 章逐条映射。UNIQUE/CHECK/FK/部分唯一索引直接落库；触发器类（模板行不可变、验收结论冻结、material_code 禁改）在 Phase 3 Migration 实现；服务层类（循环校验/超重拦截/至少一人报工/预留不碰账）均明确声明保证主体与数据库侧"无违规路径"佐证。
+见第 13 章逐条映射。UNIQUE/CHECK/FK/部分唯一索引直接落库；触发器类收敛为 13.1 设计清单 **T-1~T-12**（含 NB-2 一次置值/冲正白名单、NB-8 voided 冻结；每项已明确 BEFORE/AFTER、事件、阻止内容、事务边界与强制层归属，Phase 3 Migration 实现）；服务层类（循环校验/超重拦截/至少一人报工/预留不碰账）均明确声明保证主体与数据库侧"无违规路径"佐证。
 
 ### 20.4 State Machine Coverage：10/10 ✅
 
 见第 15 章。每套状态机=PG ENUM+状态列+事件/历史表+迁移控制；状态机 10（预留）留痕方式为已声明的设计决策。
 
+### 20.5 生命周期分类与收口覆盖：131/131 ✅（NB-1 收口）
+
+- 第 18 章为 131 表**逐张归类权威清单**：A=57 / B=48 / C=14 / D=12，无遗漏无重复；每表含①允许 UPDATE 字段/②事实后不可变/③状态推进/④事件要求/⑤void 限定六项判定，全库统一"严禁物理 DELETE"（⑥）。
+- **NB-2 张力表全量识别**：quality_inspection（T-9 一次置值）、material_consumption（T-10 冲正位）、material_issue_line（T-11 issued_qty 聚合白名单）、component_list_item（T-12 voided 冻结）——每表"窄路径白名单列+触发器强制"模式，白名单外 UPDATE 结构上被拦截。
+- **NB-3/5/6/7/8** 落点：8.4 幂等身份与显示序号分离；6.1 批次入口规则；11.6 强 FK 收口；7.4 库位查询索引；5.2/5.3/5.6 失效语义。
+- **SR-1~7**：第 21 章逐条锁定 accepted（见下章）。
+
 ---
 
-## 21. SCHEMA REVIEW ITEMS（职责待架构审查，不擅自重定义业务域）
+## 21. SCHEMA REVIEW ITEMS（SR-1~7 收口锁定 accepted）
 
-| # | 事项 | 现状 | 待裁决点 |
+> 以上 7 项经本轮收口复查：**全部为 schema 物理组织问题，未改变 Domain Model 任何业务边界**（表结构/约束/关系不受 schema 归属影响；跨 schema FK 同库允许）。**7/7 锁定 accepted**，按现状执行，Phase 3 不再重议。
+
+| # | 事项 | 现状 | 裁决结论 |
 |---|---|---|---|
-| SR-1 | 构件/零件实例归 prod | `component_list_item`/`actual_component`/`part_instance` 在 prod schema | 介于"项目主数据"与"生产执行"之间，是否独立 schema |
-| SR-2 | 质量域并入 prod | `quality_inspection`/`quality_defect`/`ncr`/`rework_order`/`final_qualification` 在 prod | 是否独立 quality schema |
-| SR-3 | 消耗/余料/废料归 whs | `material_consumption`/`surplus_material`/`scrap_record` 在 whs | 同时服务生产追溯链（高频跨域 JOIN），归属维持或调整 |
-| SR-4 | 设备域拆两处 | `equipment` 台账在 md；`equipment_event`/`equipment_impact` 在 prod | 台账与事件分离跨 schema，是否统一 |
-| SR-5 | 计划进度快照归 aud | `plan_progress_snapshot`（计算缓存）在 aud | aud=审计语义，缓存表是否应归 prod/独立报表 schema |
-| SR-6 | 外协虚拟班组 | `team.team_type` 含 'outsource' | 外协执行主体挂 team（虚拟班组）还是 md.supplier，边界待裁决 |
-| SR-7 | 受控值域双轨并存 | `material.management_class` 用 CHECK 六值；其余业务值域走 ref 字典表 | 两种实现并存，需统一"CHECK vs 字典"判定原则的例外清单 |
-
-> 以上 7 项均为 schema 职责/实现方式层面的审查项，**不影响表结构与约束设计本身**；裁决前按现状执行。
+| SR-1 | 构件/零件实例归 prod | `component_list_item`/`actual_component`/`part_instance` 在 prod | **accepted**（物理组织；域语义以 Domain Model 为准，不因 schema 归属改变） |
+| SR-2 | 质量域并入 prod | 质量五表在 prod | **accepted**（同上；独立 quality schema 留待未来规模需要再议） |
+| SR-3 | 消耗/余料/废料归 whs | 三表在 whs | **accepted**（与库存/批次同域利于追溯 JOIN；跨域查询经索引支撑） |
+| SR-4 | 设备域拆两处 | 台账在 md、事件在 prod | **accepted**（台账=主数据、事件=生产影响事实，语义分层正确） |
+| SR-5 | 计划进度快照归 aud | `plan_progress_snapshot` 在 aud | **accepted**（计算缓存非业务事实，与审计快照同为"读侧"对象） |
+| SR-6 | 外协虚拟班组 | `team.team_type` 含 'outsource' | **accepted**（V1 以虚拟班组承载外协执行主体，supplier 承担商务关系，二者分立） |
+| SR-7 | 受控值域双轨并存 | `management_class` 用 CHECK；其余走 ref 字典 | **accepted**（原则：封闭稳定短值域用 CHECK，业务可维护值域用字典；例外清单=本文 0.5 节逐项声明） |
 
 ---
 
-## 22. Phase 2 后续阶段声明
+## 22. Phase 2 后续阶段声明与最终收口状态
 
 | 项 | 状态 |
 |---|---|
@@ -1377,6 +1559,8 @@ Unique：**(container_no) WHERE status IN ('loading','sealed','shipped')**（物
 | 前端 / Android | **NOT STARTED** |
 | Docker / 业务代码 | **NOT STARTED** |
 
-本文档=Phase 2 第一阶段交付物：**Domain Model → PostgreSQL Physical Design，完整、可实现、不写 SQL**。下一阶段（SQL/Migration）须经人工审查本设计后方可启动。
+本文档=Phase 2 第一阶段交付物：**Domain Model → PostgreSQL Physical Design，完整、可实现、不写 SQL**。
+
+**最终收口状态（V1.1，2026-09-18）**：验收报告 NB-1~NB-8 已全部闭合——NB-1（第 18 章 131 表逐张归类）、NB-2（T-9/T-10/T-11/T-12 窄路径白名单）、NB-3（8.4 幂等身份/显示序号分离）、NB-4（13.1 触发器设计清单 T-1~T-12）、NB-5（6.1 批次入口规则）、NB-6（11.6 强 FK）、NB-7（7.4/16.2 索引补齐）、NB-8（5.2/5.3/5.6/19.G 失效语义）。闭环记录：`docs/v1.2_database_design_final_closure.md`。**PHASE_3_READY = YES**（下一阶段 SQL/Migration 须经人工审查本设计后启动）。
 
 ---
