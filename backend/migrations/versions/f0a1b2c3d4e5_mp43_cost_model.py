@@ -6,7 +6,17 @@
 - eng.route_template_step：operation_type_id 改可空 + 新增 project_operation_id（互斥）
 - prod.production_measure.measure_type 增加 hole_count
 - 视图 eng.v_operation_cost_trial / eng.v_project_production_cost（时间旅行 + 5 计价 + 异常标记）
-- T-17 触发器：价格版本区间不重叠 / 单一当前 / 已生效冻结（不引入 btree_gist，用 advisory 锁 + 部分唯一索引）
+- T-17 触发器：价格版本区间不重叠 / 单一当前 / 已生效冻结 / 被生产事实引用即不可变（不引入 btree_gist）
+
+计价粒度说明（审查修订）：
+- 试算视图的物理计量（weight/length/hour/hole_count）在**每个 production_report 粒度**匹配当时有效的
+  project_operation_price（按 report.occurred_at 时间旅行），再跨报告 SUM —— 不再用 MAX(report.occurred_at)
+  给整个 task 统一套价（修正跨价格版本历史计价风险）。
+- 件计价（piece）身份仍以 (构件, 工序, 正常 attempt) = 1 件 为准（task 粒度），价格按 task 代表发生时间匹配。
+- 长度口径：price_basis=length 对应 production_measure(cut_length + weld_length + mach_length)。
+  此三个子长度类型属冻结 V1.2 schema 既有定义（database_design_v1.2.md §production_measure），三者之和即
+  业务统一长度计量 basis_length_mm，并非实现时自行发明，故保留。
+- 被生产事实引用的价格版本（无论是否已生效）禁止改价/改起始日/删除；仅允许不切断已引用事实的"关闭"。
 
 Revision ID: f0a1b2c3d4e5
 Revises: e9a3b5c7d921
@@ -93,17 +103,19 @@ ALTER TABLE prod.production_measure
 
 -- ============================================================
 -- 5. 视图：成本试算明细 + 项目生产成本汇总
---    粒度 = 生产任务（attempt），非报告，避免按报告重复计数；
---    度量跨任务全部报告聚合，发生时间取自报告 MAX(occurred_at)。
+--    物理计量（weight/length/hour/hole_count）在【每个 production_report 粒度】匹配当时有效的
+--    project_operation_price（按 report.occurred_at 时间旅行），再跨报告 SUM；
+--    件计价（piece）身份仍以 (构件, 工序, 正常 attempt)=1 件 为准，价格按 task 代表发生时间匹配。
 -- ============================================================
 CREATE VIEW eng.v_operation_cost_trial AS
-WITH base AS (
+WITH report_facts AS (
+    -- 每个生产报告：自身 occurred_at + 各自的度量汇总
     SELECT
-        pt.id              AS task_id,
-        pt.execute_team_id,
-        (SELECT MAX(pr.occurred_at) FROM prod.production_report pr WHERE pr.task_id = pt.id) AS occurred_at,
+        pr.task_id,
+        pr.occurred_at,
         pt.attempt,
         (pt.attempt > 1 OR pt.rework_of_task_id IS NOT NULL) AS is_rework,
+        pt.execute_team_id,
         ac.id             AS actual_component_id,
         ac.component_no,
         ac.actual_weight,
@@ -112,52 +124,42 @@ WITH base AS (
         rts.id            AS route_template_step_id,
         rts.operation_type_id,
         rts.project_operation_id AS rts_po_id,
-        (SELECT COALESCE(SUM(pm.value), 0)
-           FROM prod.production_report pr2
-           JOIN prod.production_measure pm ON pm.report_id = pr2.id
-          WHERE pr2.task_id = pt.id AND pm.measure_type = 'weight') AS w_val,
-        (SELECT COALESCE(SUM(pm.value), 0)
-           FROM prod.production_report pr2
-           JOIN prod.production_measure pm ON pm.report_id = pr2.id
-          WHERE pr2.task_id = pt.id AND pm.measure_type IN ('cut_length','weld_length','mach_length')) AS len_val,
-        (SELECT COALESCE(SUM(rw.work_hours), 0)
-           FROM prod.production_report pr2
-           JOIN prod.production_report_worker rw ON rw.report_id = pr2.id
-          WHERE pr2.task_id = pt.id) AS hr_worker,
-        (SELECT COALESCE(SUM(pm.value), 0)
-           FROM prod.production_report pr2
-           JOIN prod.production_measure pm ON pm.report_id = pr2.id
-          WHERE pr2.task_id = pt.id AND pm.measure_type = 'hours') AS hr_val,
-        (SELECT COALESCE(SUM(pm.value), 0)
-           FROM prod.production_report pr2
-           JOIN prod.production_measure pm ON pm.report_id = pr2.id
-          WHERE pr2.task_id = pt.id AND pm.measure_type = 'hole_count') AS hole_val,
-        (SELECT CASE WHEN EXISTS (
-            SELECT 1 FROM prod.production_report pr2
-            JOIN prod.production_measure pm ON pm.report_id = pr2.id
-            WHERE pr2.task_id = pt.id AND pm.measure_type = 'weight') THEN 1 ELSE 0 END) AS has_w
-    FROM prod.production_task pt
-    JOIN eng.route_template_step rts ON rts.id = pt.route_template_step_id
-    JOIN prod.actual_component ac    ON ac.id = pt.actual_component_id
-    JOIN md.subproject sp            ON sp.id = ac.subproject_id
-    WHERE EXISTS (SELECT 1 FROM prod.production_report pr2 WHERE pr2.task_id = pt.id)
+        COALESCE(SUM(CASE WHEN pm.measure_type = 'weight' THEN pm.value END), 0) AS w_val,
+        COALESCE(SUM(CASE WHEN pm.measure_type IN ('cut_length','weld_length','mach_length') THEN pm.value END), 0) AS len_val,
+        COALESCE(SUM(rw.work_hours), 0) AS hr_worker,
+        COALESCE(SUM(CASE WHEN pm.measure_type = 'hours' THEN pm.value END), 0) AS hr_val,
+        COALESCE(SUM(CASE WHEN pm.measure_type = 'hole_count' THEN pm.value END), 0) AS hole_val,
+        CASE WHEN COUNT(CASE WHEN pm.measure_type = 'weight' THEN 1 END) > 0 THEN 1 ELSE 0 END AS has_w
+    FROM prod.production_report pr
+    JOIN prod.production_task pt      ON pt.id = pr.task_id
+    JOIN eng.route_template_step rts  ON rts.id = pt.route_template_step_id
+    JOIN prod.actual_component ac     ON ac.id = pt.actual_component_id
+    JOIN md.subproject sp             ON sp.id = ac.subproject_id
+    LEFT JOIN prod.production_measure pm ON pm.report_id = pr.id
+    LEFT JOIN prod.production_report_worker rw ON rw.report_id = pr.id
+    GROUP BY pr.id, pr.task_id, pr.occurred_at, pt.attempt, pt.rework_of_task_id, pt.execute_team_id,
+             ac.id, ac.component_no, ac.actual_weight, sp.main_project_id, sp.id,
+             rts.id, rts.operation_type_id, rts.project_operation_id
 ),
 po_resolved AS (
-    SELECT b.*, po.id AS project_operation_id, po.custom_name
-    FROM base b
+    SELECT rf.*, po.id AS project_operation_id, po.custom_name
+    FROM report_facts rf
     LEFT JOIN LATERAL (
         SELECT po2.id, po2.custom_name
         FROM eng.project_operation po2
         WHERE po2.is_active
-          AND ((b.rts_po_id IS NOT NULL AND po2.id = b.rts_po_id)
-            OR (b.rts_po_id IS NULL AND po2.operation_type_id = b.operation_type_id
-                AND (po2.main_project_id = b.main_project_id OR po2.subproject_id = b.subproject_id)))
+          AND ((rf.rts_po_id IS NOT NULL AND po2.id = rf.rts_po_id)
+            OR (rf.rts_po_id IS NULL AND po2.operation_type_id = rf.operation_type_id
+                AND (po2.main_project_id = rf.main_project_id OR po2.subproject_id = rf.subproject_id)))
         ORDER BY po2.id
         LIMIT 1
     ) po ON true
 ),
 priced AS (
-    SELECT r.*, pop.price_basis, pop.price
+    SELECT r.*,
+           MAX(r.occurred_at) OVER (PARTITION BY r.task_id) AS task_max_occurred_at,
+           pop.price_basis,
+           pop.price
     FROM po_resolved r
     LEFT JOIN LATERAL (
         SELECT x.price_basis, x.price
@@ -168,56 +170,89 @@ priced AS (
         ORDER BY x.effective_from DESC
         LIMIT 1
     ) pop ON true
+),
+-- 件计价价格：按 task 代表发生时间（MAX(report.occurred_at)）匹配，task 粒度 1 件
+task_piece_price AS (
+    SELECT DISTINCT p.task_id, popp.price_basis, popp.price
+    FROM priced p
+    LEFT JOIN LATERAL (
+        SELECT x.price_basis, x.price
+        FROM eng.project_operation_price x
+        WHERE x.project_operation_id = p.project_operation_id
+          AND x.effective_from <= p.task_max_occurred_at::date
+          AND (x.effective_to IS NULL OR p.task_max_occurred_at::date < x.effective_to)
+        ORDER BY x.effective_from DESC
+        LIMIT 1
+    ) popp ON true
+),
+agg AS (
+    SELECT
+        task_id, actual_component_id, component_no, main_project_id, subproject_id,
+        project_operation_id, operation_type_id, custom_name, execute_team_id,
+        attempt, is_rework, price_basis,
+        MAX(occurred_at) AS occurred_at,
+        -- 物理计量跨报告 SUM（各报告按自身 occurred_at 匹配价格后汇总）
+        SUM(CASE WHEN price_basis='weight' THEN CASE WHEN has_w=1 THEN w_val ELSE actual_weight END
+                 WHEN price_basis='length' THEN len_val
+                 WHEN price_basis='hour'   THEN COALESCE(hr_worker, hr_val)
+                 WHEN price_basis='hole_count' THEN hole_val
+                 ELSE 0 END) AS measure_value,
+        SUM(CASE WHEN price IS NULL THEN 0 ELSE
+              (CASE WHEN price_basis='weight' THEN CASE WHEN has_w=1 THEN w_val ELSE actual_weight END
+                    WHEN price_basis='length' THEN len_val
+                    WHEN price_basis='hour'   THEN COALESCE(hr_worker, hr_val)
+                    WHEN price_basis='hole_count' THEN hole_val
+                    ELSE 0 END) * price END) AS measured_amount,
+        BOOL_OR(price IS NULL OR project_operation_id IS NULL) AS any_missing_price,
+        BOOL_OR(execute_team_id IS NULL) AS any_missing_team,
+        BOOL_OR(price_basis='weight' AND has_w=0 AND actual_weight IS NULL) AS w_missing,
+        BOOL_OR(price_basis='weight' AND has_w=0 AND actual_weight IS NOT NULL) AS w_fallback,
+        BOOL_OR(price_basis='length' AND len_val=0) AS len_missing,
+        BOOL_OR(price_basis='hour' AND hr_worker=0 AND hr_val=0) AS hr_missing,
+        BOOL_OR(price_basis='hole_count' AND hole_val=0) AS hole_missing,
+        MAX(price) AS rep_price
+    FROM priced
+    GROUP BY task_id, actual_component_id, component_no, main_project_id, subproject_id,
+             project_operation_id, operation_type_id, custom_name, execute_team_id,
+             attempt, is_rework, price_basis
 )
 SELECT
-    task_id,
-    actual_component_id,
-    component_no,
-    main_project_id,
-    subproject_id,
-    project_operation_id,
-    operation_type_id,
-    custom_name,
-    execute_team_id,
-    occurred_at,
-    attempt,
-    is_rework,
-    price_basis,
-    price,
+    a.task_id,
+    a.actual_component_id,
+    a.component_no,
+    a.main_project_id,
+    a.subproject_id,
+    a.project_operation_id,
+    a.operation_type_id,
+    a.custom_name,
+    a.execute_team_id,
+    a.occurred_at,
+    a.attempt,
+    a.is_rework,
+    a.price_basis,
+    CASE WHEN a.price_basis = 'piece' THEN tp.price ELSE a.rep_price END AS price,
+    CASE WHEN a.price_basis = 'piece' THEN 1 ELSE a.measure_value END AS measure_value,
     CASE
-        WHEN price_basis = 'weight'  THEN CASE WHEN has_w = 1 THEN w_val ELSE actual_weight END
-        WHEN price_basis = 'piece'   THEN 1
-        WHEN price_basis = 'length'  THEN len_val
-        WHEN price_basis = 'hour'    THEN COALESCE(hr_worker, hr_val)
-        WHEN price_basis = 'hole_count' THEN hole_val
-    END AS measure_value,
-    CASE
-        WHEN project_operation_id IS NULL OR price IS NULL THEN 'MISSING_PRICE'
-        WHEN execute_team_id IS NULL THEN 'MISSING_TEAM'
-        WHEN price_basis = 'weight' AND has_w = 0 AND actual_weight IS NULL THEN 'MISSING_MEASURE'
-        WHEN price_basis = 'weight' AND has_w = 0 AND actual_weight IS NOT NULL THEN 'MEASURE_FALLBACK'
-        WHEN price_basis = 'length'  AND len_val = 0 THEN 'MISSING_MEASURE'
-        WHEN price_basis = 'hour'    AND hr_worker = 0 AND hr_val = 0 THEN 'MISSING_MEASURE'
-        WHEN price_basis = 'hole_count' AND hole_val = 0 THEN 'MISSING_MEASURE'
+        WHEN a.any_missing_price THEN 'MISSING_PRICE'
+        WHEN a.any_missing_team THEN 'MISSING_TEAM'
+        WHEN a.price_basis = 'weight' AND a.w_missing THEN 'MISSING_MEASURE'
+        WHEN a.price_basis = 'weight' AND a.w_fallback THEN 'MEASURE_FALLBACK'
+        WHEN a.price_basis = 'length' AND a.len_missing THEN 'MISSING_MEASURE'
+        WHEN a.price_basis = 'hour'   AND a.hr_missing THEN 'MISSING_MEASURE'
+        WHEN a.price_basis = 'hole_count' AND a.hole_missing THEN 'MISSING_MEASURE'
         ELSE 'PRECISE'
     END AS anomaly_status,
     CASE
-        WHEN price IS NULL THEN NULL
-        WHEN price_basis = 'weight'  AND has_w = 0 AND actual_weight IS NULL THEN NULL
-        WHEN price_basis = 'length'  AND len_val = 0 THEN NULL
-        WHEN price_basis = 'hour'    AND hr_worker = 0 AND hr_val = 0 THEN NULL
-        WHEN price_basis = 'hole_count' AND hole_val = 0 THEN NULL
-        ELSE (
-            CASE
-                WHEN price_basis = 'weight'  THEN CASE WHEN has_w = 1 THEN w_val ELSE actual_weight END
-                WHEN price_basis = 'piece'   THEN 1
-                WHEN price_basis = 'length'  THEN len_val
-                WHEN price_basis = 'hour'    THEN COALESCE(hr_worker, hr_val)
-                WHEN price_basis = 'hole_count' THEN hole_val
-            END
-        ) * price
+        WHEN a.any_missing_price THEN NULL
+        WHEN a.price_basis = 'weight' AND a.w_missing THEN NULL
+        WHEN a.price_basis = 'length' AND a.len_missing THEN NULL
+        WHEN a.price_basis = 'hour'   AND a.hr_missing THEN NULL
+        WHEN a.price_basis = 'hole_count' AND a.hole_missing THEN NULL
+        WHEN a.price_basis = 'piece' THEN 1 * tp.price
+        ELSE a.measured_amount
     END AS amount
-FROM priced;
+FROM agg a
+LEFT JOIN task_piece_price tp ON tp.task_id = a.task_id;
 
 CREATE VIEW eng.v_project_production_cost AS
 SELECT
@@ -236,21 +271,54 @@ GROUP BY main_project_id, subproject_id, project_operation_id, execute_team_id,
          date_trunc('month', occurred_at);
 
 -- ============================================================
--- 6. T-17 价格版本守卫（不引入 btree_gist）
+-- 6. 价格版本引用判定 + T-17 价格版本守卫（不引入 btree_gist）
 -- ============================================================
+-- 判断某价格版本是否已被生产事实引用：存在 production_report 落入其生效窗口
+-- 且该报告所属 task 解析到的 project_operation 正是本版本对应的 po。
+CREATE OR REPLACE FUNCTION mes_po_price_is_referenced(
+    p_po_id    BIGINT,
+    p_eff_from DATE,
+    p_eff_to   DATE
+) RETURNS BOOLEAN AS $$
+DECLARE
+    n INT;
+BEGIN
+    SELECT COUNT(*) INTO n
+    FROM prod.production_report pr
+    JOIN prod.production_task pt      ON pt.id = pr.task_id
+    JOIN eng.route_template_step rts ON rts.id = pt.route_template_step_id
+    JOIN prod.actual_component ac     ON ac.id = pt.actual_component_id
+    JOIN md.subproject sp             ON sp.id = ac.subproject_id
+    WHERE pr.occurred_at::date >= p_eff_from
+      AND (p_eff_to IS NULL OR pr.occurred_at::date < p_eff_to)
+      AND (rts.project_operation_id = p_po_id
+           OR (rts.project_operation_id IS NULL AND EXISTS (
+               SELECT 1 FROM eng.project_operation po2
+               WHERE po2.id = p_po_id
+                 AND po2.operation_type_id = rts.operation_type_id
+                 AND (po2.main_project_id = sp.main_project_id OR po2.subproject_id = sp.id))));
+    RETURN n > 0;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE OR REPLACE FUNCTION mes_t17_price_version_guard() RETURNS trigger AS $$
 DECLARE
     v_is_future boolean;
+    v_ref       boolean;
+    v_max_dt    date;
 BEGIN
     -- 按 project_operation 串行化（事务级 advisory 锁），避免并发改价产生两个当前版本
     IF TG_OP IN ('INSERT', 'UPDATE') THEN
         PERFORM pg_advisory_xact_lock(NEW.project_operation_id);
     END IF;
 
+    -- DELETE：已生效禁止删除；被生产事实引用的版本（即便未来）亦禁止删除
     IF TG_OP = 'DELETE' THEN
-        -- 已生效（effective_from <= 今天）价格版本禁止删除；未来版本可删
         IF OLD.effective_from <= CURRENT_DATE THEN
             RAISE EXCEPTION 'T-17: 已生效价格版本(effective_from=%)禁止删除', OLD.effective_from;
+        END IF;
+        IF mes_po_price_is_referenced(OLD.project_operation_id, OLD.effective_from, OLD.effective_to) THEN
+            RAISE EXCEPTION 'T-17: 已被生产事实引用的价格版本(effective_from=%)禁止删除', OLD.effective_from;
         END IF;
         RETURN OLD;
     END IF;
@@ -275,19 +343,54 @@ BEGIN
            AND is_current;
     END IF;
 
-    -- 未来版本（effective_from > 今天）：自由编辑/删除
-    v_is_future := (NEW.effective_from > CURRENT_DATE);
-    IF v_is_future THEN
+    -- INSERT：仅做上述校验
+    IF TG_OP = 'INSERT' THEN
         RETURN NEW;
     END IF;
 
-    -- 已生效（effective_from <= 今天）
-    IF TG_OP = 'UPDATE' THEN
+    -- UPDATE：被生产事实引用的版本锁定价格/口径/起始日/归属；关闭不得切断已引用事实
+    v_ref := mes_po_price_is_referenced(OLD.project_operation_id, OLD.effective_from, OLD.effective_to);
+    v_is_future := (NEW.effective_from > CURRENT_DATE);
+
+    IF v_ref THEN
+        IF NEW.price IS DISTINCT FROM OLD.price
+           OR NEW.price_basis IS DISTINCT FROM OLD.price_basis
+           OR NEW.effective_from IS DISTINCT FROM OLD.effective_from
+           OR NEW.version_no IS DISTINCT FROM OLD.version_no
+           OR NEW.project_operation_id IS DISTINCT FROM OLD.project_operation_id
+           OR NEW.approved_by IS DISTINCT FROM OLD.approved_by THEN
+            RAISE EXCEPTION 'T-17: 已被生产事实引用的价格版本禁止修改价格/口径/生效起始日/归属（历史结果不可变）';
+        END IF;
+        IF NEW.effective_to IS DISTINCT FROM OLD.effective_to THEN
+            -- 关闭：不得重新开放（置空），且关闭日期不得早于已引用事实发生时间
+            IF NEW.effective_to IS NULL THEN
+                RAISE EXCEPTION 'T-17: 已被引用的价格版本不得重新开放（effective_to 置空会改变历史）';
+            END IF;
+            SELECT MAX(pr.occurred_at)::date INTO v_max_dt
+            FROM prod.production_report pr
+            JOIN prod.production_task pt      ON pt.id = pr.task_id
+            JOIN eng.route_template_step rts ON rts.id = pt.route_template_step_id
+            JOIN prod.actual_component ac     ON ac.id = pt.actual_component_id
+            JOIN md.subproject sp             ON sp.id = ac.subproject_id
+            WHERE pr.occurred_at::date >= OLD.effective_from
+              AND (OLD.effective_to IS NULL OR pr.occurred_at::date < OLD.effective_to)
+              AND (rts.project_operation_id = OLD.project_operation_id
+                   OR (rts.project_operation_id IS NULL AND EXISTS (
+                       SELECT 1 FROM eng.project_operation po2
+                       WHERE po2.id = OLD.project_operation_id
+                         AND po2.operation_type_id = rts.operation_type_id
+                         AND (po2.main_project_id = sp.main_project_id OR po2.subproject_id = sp.id))));
+            IF v_max_dt IS NOT NULL AND NEW.effective_to < v_max_dt THEN
+                RAISE EXCEPTION 'T-17: 关闭日期(%)早于已引用事实发生时间(%)，将改变历史结果', NEW.effective_to, v_max_dt;
+            END IF;
+        END IF;
+    END IF;
+
+    -- 已生效（effective_from <= 今天）：冻结（仅允许安全关闭）
+    IF NOT v_is_future THEN
         IF OLD.is_current = false THEN
-            -- 已关闭历史版本：完全冻结（回放用，改价=关旧+开新）
             RAISE EXCEPTION 'T-17: 已生效历史价格版本禁止修改（回放用；改价=关旧版本+新建版本）';
         END IF;
-        -- 当前开放版本：仅允许关闭（effective_to / is_current），不得直接改价格/区间
         IF (NEW.price IS DISTINCT FROM OLD.price)
            OR (NEW.price_basis IS DISTINCT FROM OLD.price_basis)
            OR (NEW.effective_from IS DISTINCT FROM OLD.effective_from)
@@ -299,6 +402,7 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- 未来版本 & 未被引用（或被引用但仅做不切断事实的关闭）：自由
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -311,6 +415,7 @@ CREATE OR REPLACE TRIGGER trg_t17_price_version_guard
 DOWNGRADE_SQL = r"""
 DROP TRIGGER IF EXISTS trg_t17_price_version_guard ON eng.project_operation_price;
 DROP FUNCTION IF EXISTS mes_t17_price_version_guard();
+DROP FUNCTION IF EXISTS mes_po_price_is_referenced(BIGINT, DATE, DATE);
 
 DROP VIEW IF EXISTS eng.v_project_production_cost;
 DROP VIEW IF EXISTS eng.v_operation_cost_trial;

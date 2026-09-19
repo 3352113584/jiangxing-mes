@@ -550,3 +550,64 @@ def test_price_service_close_old_create_new(conn):
     finally:
         db.close()
         eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 审查修订：跨价格版本计价粒度 + 未来价被引用即不可变
+# ---------------------------------------------------------------------------
+def test_same_task_reports_cross_price_versions(conn):
+    """同一 production_task 的多个报告跨两个价格版本时，每个事实按自身 occurred_at 匹配价格。"""
+    pid, sid = make_project(conn)
+    step, ot = make_standard_step(conn, pid, "cutting")
+    team = make_team(conn)
+    po = add_po_standard(conn, pid, "OP-CUT", ot)
+    # 两个版本：3 月 100 / 5 月 120
+    add_price(conn, po, 100.0, "weight", date(2026, 3, 1), date(2026, 5, 1), is_current=False)
+    add_price(conn, po, 120.0, "weight", date(2026, 5, 1), None, is_current=True)
+    acid = make_component(conn, sid, "C1")
+    task = make_task(conn, acid, step, team)
+    # 同一 task 两份报告跨两个版本（不同 action_key 规避唯一约束）
+    make_report(conn, task, acid, step, team, datetime(2026, 3, 15, 10, 0, 0),
+                measures={"weight": 5.0}, action_key="start")
+    make_report(conn, task, acid, step, team, datetime(2026, 5, 15, 10, 0, 0),
+                measures={"weight": 5.0}, action_key="complete")
+    r = trial(conn, task_id=task)[0]
+    assert r.price_basis == "weight"
+    assert r.measure_value == 10.0                       # 5 + 5
+    assert abs(r.amount - 1100.0) < 1e-9                 # 5*100 + 5*120
+    assert r.anomaly_status == "PRECISE"
+
+
+def test_future_price_referenced_by_fact_is_immutable(conn):
+    """未来价格一旦被生产事实引用，禁止改价/删除；未被引用的未来价格仍自由编辑/删除。"""
+    pid, sid = make_project(conn)
+    step, ot = make_standard_step(conn, pid, "cutting")
+    team = make_team(conn)
+    # po A：未来价格（effective_from 2026-10-01）已被生产事实引用
+    poA = add_po_standard(conn, pid, "OP-A", ot)
+    add_price(conn, poA, 100.0, "weight", date(2026, 10, 1), None, is_current=True)
+    acidA = make_component(conn, sid, "CA")
+    taskA = make_task(conn, acidA, step, team)
+    make_report(conn, taskA, acidA, step, team, datetime(2026, 10, 2, 10, 0, 0),
+                measures={"weight": 5.0})  # 落入 poA 价格窗口
+    # 改价 -> 必须失败
+    expect_fail(conn,
+        "UPDATE eng.project_operation_price SET price=%s "
+        "WHERE project_operation_id=%s AND effective_from=%s",
+        (130.0, poA, date(2026, 10, 1)), "T-17")
+    # 删除 -> 必须失败
+    expect_fail(conn,
+        "DELETE FROM eng.project_operation_price WHERE project_operation_id=%s AND effective_from=%s",
+        (poA, date(2026, 10, 1)), "T-17")
+    # po B：未来价格（2026-11-01）未被任何事实引用 -> 仍可自由编辑/删除
+    poB = add_po_standard(conn, pid, "OP-B", ot)
+    add_price(conn, poB, 200.0, "weight", date(2026, 11, 1), None, is_current=True)
+    conn.execute(
+        "UPDATE eng.project_operation_price SET price=%s WHERE project_operation_id=%s AND effective_from=%s",
+        (250.0, poB, date(2026, 11, 1)))
+    conn.execute(
+        "DELETE FROM eng.project_operation_price WHERE project_operation_id=%s AND effective_from=%s",
+        (poB, date(2026, 11, 1)))
+    n = conn.execute(
+        "SELECT count(*) FROM eng.project_operation_price WHERE project_operation_id=%s", (poB,)).fetchone()[0]
+    assert n == 0
