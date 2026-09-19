@@ -203,3 +203,12 @@ temp/
 .workbuddy/
 # M-P4-3 临时诊断探针（非正式测试/迁移/服务代码，仅本地调试用）
 backend/_probe_mp43.py
+
+# -------------------- 部署产物（不入库） --------------------
+# 构建好的前端静态资源（由 deploy/scripts/build_frontend.sh 生成）
+deploy/frontend-dist/*
+!deploy/frontend-dist/.gitkeep
+# TLS 证书（实际 .pem/.key/.crt 已被上方全局规则忽略；此处保留目录占位）
+deploy/certs/*
+!deploy/certs/.gitkeep
+# 部署用真实环境变量文件（deploy/.env 已被上方 .env 规则忽略）
