@@ -7,10 +7,15 @@
 from __future__ import annotations
 
 import os
+import re
 
 import yaml
 
 COMPOSE_PATH = os.path.join("deploy", "docker-compose.prod.yml")
+GATEWAY_PATH = os.path.join("deploy", "nginx", "gateway.conf")
+INITDB_PATH = os.path.join("deploy", "docker", "initdb", "01_create_roles.sh")
+ENTRYPOINT_PATH = os.path.join("backend", "docker-entrypoint.sh")
+GITATTRIBUTES_PATH = ".gitattributes"
 
 
 def _load():
@@ -131,12 +136,124 @@ def test_gateway_depends_on_backend():
 
 
 def test_timezone_configured():
+    """时区必须为 Asia/Shanghai，但【不得】通过 initdb 参数设置。
+
+    F1 修复说明：initdb 没有 --timezone 选项，传该参数会导致
+    `initdb: unrecognized option: timezone=Asia/Shanghai`，
+    PostgreSQL 无法初始化、容器进入 Restarting。
+    正确做法是只设置 TZ / PGTZ 环境变量（initdb 阶段即读取 TZ）。
+    实机已验证：仅设 TZ 时 SHOW timezone 返回 Asia/Shanghai。
+    """
     data = _load()
     pg_env = data["services"]["postgres"]["environment"]
     assert pg_env.get("TZ") == "Asia/Shanghai"
     assert pg_env.get("PGTZ") == "Asia/Shanghai"
-    assert "timezone=Asia/Shanghai" in pg_env.get("POSTGRES_INITDB_ARGS", "")
+
+    initdb_args = pg_env.get("POSTGRES_INITDB_ARGS", "")
+    assert "--timezone" not in initdb_args, (
+        "POSTGRES_INITDB_ARGS 不得包含 --timezone（initdb 无该选项，会导致初始化失败）"
+    )
+    assert "timezone=Asia/Shanghai" not in initdb_args
+    # 编码与 locale 仍应显式指定
+    assert "--encoding=UTF8" in initdb_args
+    assert "--locale=C.UTF-8" in initdb_args
+
     assert data["services"]["backend"]["environment"].get("TZ") == "Asia/Shanghai"
+
+
+# ---------------------------------------------------------------------------
+# F3 / F4 / F2 / F5 回归防护（对应 Staging 实机验证发现的部署层缺陷）
+# ---------------------------------------------------------------------------
+def test_initdb_script_has_no_psql_var_inside_dollar_quote():
+    """F3：美元引用块（DO $$ ... $$）内不得使用 psql 变量语法 :'var'。
+
+    美元引用块对 psql 不透明、不会插值，语句原样送交服务端后报
+    `ERROR: syntax error at or near ":"`，导致 mes_migration / mes_app
+    从未被创建、账号分离在生产实际失效。
+    """
+    text = open(INITDB_PATH, encoding="utf-8").read()
+    for m in re.finditer(r"\$\$(.*?)\$\$", text, re.S):
+        body = m.group(1)
+        assert not re.search(r":'", body), (
+            "DO $$ ... $$ 内不得使用 :'var'（psql 不会在美元引用块内插值）"
+        )
+        assert not re.search(r':"', body), (
+            'DO $$ ... $$ 内不得使用 :"var"（psql 不会在美元引用块内插值）'
+        )
+
+
+def test_initdb_script_uses_format_gexec_and_correct_role_attributes():
+    """F3：角色必须用 format(%L) + \\gexec 创建，且属性不可放宽。"""
+    text = open(INITDB_PATH, encoding="utf-8").read()
+    assert "format(" in text, "应使用 format(%L) 生成安全引用的 SQL 文本"
+    assert "\\gexec" in text, "应使用 \\gexec 执行 format 生成的语句"
+
+    # 迁移角色：NOSUPERUSER + CREATEROLE + NOCREATEDB
+    assert "mes_migration" in text
+    assert "CREATEROLE NOCREATEDB NOSUPERUSER" in text, (
+        "mes_migration 必须为 NOSUPERUSER + CREATEROLE + NOCREATEDB"
+    )
+    # 应用角色：NOSUPERUSER + NOCREATEROLE + NOCREATEDB
+    assert "mes_app" in text
+    assert "NOSUPERUSER NOCREATEROLE NOCREATEDB" in text, (
+        "mes_app 必须为 NOSUPERUSER + NOCREATEROLE + NOCREATEDB"
+    )
+    # 数据库归属与连接权限
+    assert "ALTER DATABASE" in text and "OWNER TO mes_migration" in text
+    assert "GRANT CONNECT ON DATABASE" in text
+    # 口令缺失时必须立即失败，避免建出空口令账号
+    assert "MES_MIGRATION_PASSWORD:?" in text
+    assert "MES_APP_PASSWORD:?" in text
+
+
+def test_gateway_log_format_name_does_not_conflict_with_nginx_default():
+    """F4：log_format 不得命名为 main（nginx.conf 已定义 main）。
+
+    否则 nginx 启动报 `[emerg] duplicate "log_format" name "main"`，网关无法启动。
+    同时确认 HTTPS / TLS1.2+1.3 / HSTS 等安全要求未被削弱。
+    """
+    text = open(GATEWAY_PATH, encoding="utf-8").read()
+    names = re.findall(r"^\s*log_format\s+([A-Za-z0-9_]+)\s", text, re.M)
+    assert names, "gateway.conf 应定义自定义 access log 格式"
+    assert "main" not in names, (
+        'log_format 不得命名为 "main"（与 nginx.conf 冲突，会导致 nginx 无法启动）'
+    )
+    assert len(names) == len(set(names)), f"log_format 定义重复: {names}"
+    for n in set(names):
+        assert f"access_log /var/log/nginx/access.log {n};" in text, (
+            f"access_log 必须显式引用已定义格式 {n}"
+        )
+
+    # 安全要求不得被削弱
+    assert "listen 443 ssl;" in text
+    assert "ssl_protocols TLSv1.2 TLSv1.3;" in text
+    assert "Strict-Transport-Security" in text
+    assert "X-Content-Type-Options" in text
+    assert "X-Frame-Options" in text
+
+
+def test_shell_entrypoints_are_lf():
+    """F2/F5：shell 脚本必须为 LF 且以 #!/bin/sh 开头，才能在 Linux 容器内直接执行。
+
+    CRLF 会让内核把 shebang 读成 `#!/bin/sh\\r`，报
+    `/bin/sh^M: bad interpreter: No such file or directory`。
+    """
+    for path in (INITDB_PATH, ENTRYPOINT_PATH):
+        raw = open(path, "rb").read()
+        assert b"\r\n" not in raw, f"{path} 含 CRLF，Linux 下无法执行"
+        assert b"\r" not in raw, f"{path} 含裸 CR，Linux 下无法执行"
+        assert raw.startswith(b"#!/bin/sh\n"), f"{path} 必须以 #!/bin/sh 开头并为 LF"
+
+
+def test_gitattributes_forces_lf():
+    """.gitattributes 必须强制文本文件为 LF，避免开发机 core.autocrlf 污染归档。"""
+    text = open(GITATTRIBUTES_PATH, encoding="utf-8").read()
+    assert "text=auto eol=lf" in text, "应设置 * text=auto eol=lf"
+    for pattern in ("*.sh", "*.py", "*.sql", "*.yml", "*.conf", "Dockerfile"):
+        assert pattern in text, f".gitattributes 应显式声明 {pattern} 为 LF"
+    # 二进制类型不得被转换
+    for pattern in ("*.png", "*.xlsx", "*.apk"):
+        assert pattern in text, f".gitattributes 应声明 {pattern} 为 binary"
 
 
 def test_secrets_not_hardcoded_in_compose():

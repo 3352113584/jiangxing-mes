@@ -34,9 +34,13 @@ services:
       MES_APP_PASSWORD: "${MES_APP_PASSWORD:?MES_APP_PASSWORD 必须在 deploy/.env 中设置}"
       MES_MIGRATION_PASSWORD: "${MES_MIGRATION_PASSWORD:?MES_MIGRATION_PASSWORD 必须在 deploy/.env 中设置}"
       # 时区必须 Asia/Shanghai（T-17 使用 CURRENT_DATE，依赖实例时区）
+      # 注意：仅通过 TZ / PGTZ 环境变量设置时区，不要向 initdb 传 --timezone
+      # （initdb 无该选项，传入会导致 "unrecognized option" 并使 PostgreSQL
+      #  初始化失败、容器进入 Restarting）。initdb 阶段即读取 TZ，实测
+      #  SHOW timezone 返回 Asia/Shanghai。
       TZ: Asia/Shanghai
       PGTZ: Asia/Shanghai
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --timezone=Asia/Shanghai"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
     volumes:
       - mes_postgres_data:/var/lib/postgresql/data
       # 首次初始化（数据卷为空）时创建 mes_migration / mes_app 角色，落实账号分离
