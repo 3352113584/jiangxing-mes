@@ -209,17 +209,15 @@ def register(
     if was_not_started:
         ac.production_status = "in_production"
         db.add(ActualComponentEvent(actual_component_id=ac.id, event_type="start", occurred_at=now))
-    total = db.execute(
-        select(func.count())
-        .select_from(ProductionTask)
-        .where(ProductionTask.actual_component_id == ac.id)
-    ).scalar() or 0
-    done = db.execute(
-        select(func.count())
-        .select_from(ProductionTask)
-        .where(ProductionTask.actual_component_id == ac.id, ProductionTask.status == "completed")
-    ).scalar() or 0
-    if total > 0 and total == done:
+
+    # G-2（冻结语义）：production_completed 仅由 E-2 第 17 道 painting（油漆）完成触发。
+    # 已移除旧的「所有 production_task 完成（total == done）」泛化逻辑；
+    # 不再以 全部 route step 完成 / 成品检完成 / 结算完成 / 发运完成 作为 production_completed 依据。
+    # 识别方式：按 operation_type.code == 'painting'（语义锚定，不依赖 step_no，
+    # 以兼容未来项目自定义工序而不改变本触发点）。
+    step = db.get(RouteTemplateStep, task.route_template_step_id)
+    ot = db.get(OperationType, step.operation_type_id) if step else None
+    if ot is not None and ot.code == "painting" and task.status == "completed":
         ac.production_status = "production_completed"
         db.add(ActualComponentEvent(actual_component_id=ac.id, event_type="complete", occurred_at=now))
 
