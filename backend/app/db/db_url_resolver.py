@@ -2,7 +2,7 @@
 
 生产环境必须使用以下两个独立变量（不同数据库角色，最小权限原则）：
 - MES_DATABASE_URL          : 应用运行态连接（最小权限角色，如 mes_app）
-- MES_MIGRATION_DATABASE_URL: DDL/迁移连接（超级用户角色，如 postgres）
+- MES_MIGRATION_DATABASE_URL: DDL/迁移连接（独立迁移角色，如 mes_migration，非超级用户）
 
 历史遗留变量 MES_DB_URL 仅作为迁移 URL 的兼容回退，不推荐继续使用。
 
@@ -23,7 +23,7 @@ def resolve_app_db_url() -> str:
 
 
 def resolve_migration_db_url() -> str:
-    """迁移/DDL 数据库连接串（超级用户角色）。
+    """迁移/DDL 数据库连接串（独立迁移角色，如 mes_migration，非超级用户）。
 
     优先 MES_MIGRATION_DATABASE_URL；兼容旧变量 MES_DB_URL；最后回退默认。
     """

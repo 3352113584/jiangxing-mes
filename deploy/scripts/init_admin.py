@@ -1,7 +1,7 @@
 """一次性管理员初始化（运维脚本，不在应用运行态调用）。
 
 用法（在已部署环境，且 deploy/.env 已提供数据库变量）：
-  export MES_DATABASE_URL=postgresql+psycopg://mes_user:***@postgres:5432/jiangxing_mes
+  export MES_DATABASE_URL=postgresql+psycopg://mes_app:***@postgres:5432/jiangxing_mes
   export MES_INIT_ADMIN_USER=admin
   export MES_INIT_ADMIN_PASSWORD='<强密码，从密钥管理获取>'
   python deploy/scripts/init_admin.py
