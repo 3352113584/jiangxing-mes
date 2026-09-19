@@ -197,3 +197,9 @@ temp/
 .eslintcache
 .stylelintcache
 .parcel-cache
+
+# -------------------- 本地 WorkBuddy / 临时探针（不入库） --------------------
+# WorkBuddy 本地工作区（含部署密码等敏感信息，绝不提交）
+.workbuddy/
+# M-P4-3 临时诊断探针（非正式测试/迁移/服务代码，仅本地调试用）
+backend/_probe_mp43.py
