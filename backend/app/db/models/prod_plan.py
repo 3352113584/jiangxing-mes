@@ -239,7 +239,7 @@ class ProductionMeasure(TableBase, BFactMixin):
     __tablename__ = "production_measure"
     __table_args__ = (
         UniqueConstraint("report_id", "measure_type", name="uq_production_measure_report_type"),
-        CheckConstraint("measure_type IN ('weight','cut_length','weld_length','mach_length','hours')",
+        CheckConstraint("measure_type IN ('weight','cut_length','weld_length','mach_length','hours','hole_count')",
                         name="ck_production_measure_type_values"),
         {"schema": SCHEMA},
     )

@@ -4,9 +4,9 @@ Design doc: database_design_v1.2.md chapter 4.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import ALifecycleMixin, AMasterDataMixin, Base, BFactMixin, TableBase
@@ -161,14 +161,76 @@ class RouteTemplate(TableBase, ALifecycleMixin):
 
 
 class RouteTemplateStep(TableBase, ALifecycleMixin):
-    """4.4 工序行（MCR-1 同构）；被引用后语义列 T-5 禁改。"""
+    """4.4 工序行（MCR-1 同构）；被引用后语义列 T-5 禁改。
+
+    M-P4-3：operation_type_id 改为可空，新增 project_operation_id，二者互斥
+    （标准工序=operation_type_id，项目自定义工序=project_operation_id）。"""
     __tablename__ = "route_template_step"
     __table_args__ = (
         UniqueConstraint("template_id", "step_no", name="uq_route_template_step_template_id_step_no"),
+        CheckConstraint(
+            "(operation_type_id IS NOT NULL AND project_operation_id IS NULL) OR "
+            "(operation_type_id IS NULL AND project_operation_id IS NOT NULL)",
+            name="ck_rts_op_xor"),
         {"schema": SCHEMA},
     )
     template_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("eng.route_template.id", ondelete="RESTRICT"), nullable=False)
     step_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    operation_type_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"), nullable=False)
+    operation_type_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"), nullable=True)
+    project_operation_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("eng.project_operation.id", ondelete="RESTRICT"), nullable=True)
     default_requirement: Mapped[str | None] = mapped_column(String(255))
     step_status: Mapped[str] = mapped_column(enum_step_status, nullable=False, server_default=text("'active'"))
+
+
+# ============ M-P4-3 生产成本 / 班组结算口径模型 ============
+# 项目工序身份（A 类主数据）与工序价格版本（B 类历史事实）。
+# default_team_id 仅用于未来任务生成默认班组，绝不参与实际成本归属。
+
+class ProjectOperation(TableBase, AMasterDataMixin):
+    """M-P4-3 项目工序稳定身份：标准工序(operation_type_id) 与 自定义工序(custom_name) 互斥。"""
+    __tablename__ = "project_operation"
+    __table_args__ = (
+        CheckConstraint(
+            "(operation_type_id IS NOT NULL AND custom_name IS NULL) OR "
+            "(operation_type_id IS NULL AND custom_name IS NOT NULL)",
+            name="ck_po_identity"),
+        CheckConstraint("main_project_id IS NOT NULL OR subproject_id IS NOT NULL", name="ck_po_scope"),
+        UniqueConstraint("main_project_id", "project_operation_code", name="uq_po_main_project_code"),
+        UniqueConstraint("subproject_id", "project_operation_code", name="uq_po_subproject_code"),
+        {"schema": SCHEMA},
+    )
+    main_project_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("md.main_project.id", ondelete="RESTRICT"))
+    subproject_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("md.subproject.id", ondelete="RESTRICT"))
+    project_operation_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_type_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"))
+    custom_name: Mapped[str | None] = mapped_column(String(128))
+    default_team_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("md.team.id", ondelete="RESTRICT"))
+
+
+class ProjectOperationPrice(TableBase, BFactMixin):
+    """M-P4-3 不可破坏的历史价格版本（B 类事实）。T-17 守卫：区间不重叠、单一当前、已生效冻结。"""
+    __tablename__ = "project_operation_price"
+    __table_args__ = (
+        UniqueConstraint("project_operation_id", "version_no", name="uq_pop_po_version"),
+        CheckConstraint(
+            "price_basis IN ('weight','piece','length','hour','hole_count')",
+            name="ck_pop_price_basis"),
+        CheckConstraint("effective_to IS NULL OR effective_to >= effective_from", name="ck_pop_range"),
+        Index("ix_pop_lookup", "project_operation_id", "effective_from", "effective_to"),
+        Index("uq_pop_current", "project_operation_id", unique=True,
+              postgresql_where=text("is_current")),
+        {"schema": SCHEMA},
+    )
+    project_operation_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("eng.project_operation.id", ondelete="RESTRICT"), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    price_basis: Mapped[str] = mapped_column(String(16), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    approved_by: Mapped[int | None] = mapped_column(BigInteger)
