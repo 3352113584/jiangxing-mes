@@ -4,12 +4,23 @@
 """
 from __future__ import annotations
 
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True, future=True)
+# 生产连接池：避免云数据库连接因空闲被中间件断开（pool_recycle），
+# 并通过 pre_ping 检测失效连接。参数可由环境变量覆盖。
+engine = create_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=int(os.getenv("MES_DB_POOL_SIZE", "10")),
+    max_overflow=int(os.getenv("MES_DB_MAX_OVERFLOW", "20")),
+    pool_recycle=int(os.getenv("MES_DB_POOL_RECYCLE", "1800")),
+    future=True,
+)
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,

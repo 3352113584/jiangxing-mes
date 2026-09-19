@@ -20,15 +20,17 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.db.base import Base  # noqa: E402
 from app.db import models  # noqa: E402,F401  (register all tables)
+from app.db.db_url_resolver import resolve_migration_db_url  # noqa: E402
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Default dev URL (PG16 portable on port 15432, trust auth).
+# 迁移连接串统一使用 MES_MIGRATION_DATABASE_URL（与 config.py 一致），
+# 兼容旧变量 MES_DB_URL；默认回退到本地开发库。
 DEFAULT_URL = "postgresql+psycopg://postgres@localhost:15432/jiangxing_mes"
-db_url = os.environ.get("MES_DB_URL", DEFAULT_URL)
+db_url = resolve_migration_db_url()
 config.set_main_option("sqlalchemy.url", db_url)
 
 target_metadata = Base.metadata
