@@ -420,7 +420,7 @@ def test_t17_single_current_invariant(conn):
     po = add_po_standard(conn, pid, "OP-CUT", ot)
     add_price(conn, po, 100.0, "weight", date(2026, 1, 1), None, is_current=True)
     # 通过服务路径关旧+开新，验证始终只有一个当前版本
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, text
     from sqlalchemy.orm import sessionmaker
     from app.services import price_service
     conn.commit()
@@ -431,9 +431,9 @@ def test_t17_single_current_invariant(conn):
         price_service.create_price_version(db, project_operation_id=po, price=120.0,
                                            price_basis="weight", effective_from=date(2026, 4, 1))
         db.commit()
-        n = db.execute(
+        n = db.execute(text(
             "SELECT count(*) FROM eng.project_operation_price "
-            "WHERE project_operation_id=%s AND is_current", (po,)).scalar()
+            "WHERE project_operation_id=:po AND is_current"), {"po": po}).scalar()
         assert n == 1
     finally:
         db.close()
