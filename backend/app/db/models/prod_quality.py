@@ -164,6 +164,22 @@ class ReworkOrder(TableBase, BFactMixin):
         UniqueConstraint("order_no", name="uq_rework_order_no"),
         CheckConstraint("source_type IN ('inspection','ncr','engineering_change')",
                         name="ck_rework_order_source_type_values"),
+        # 责任主体一致性（R4 §七 DB 层防旁路）：
+        #   TEAM     ⇒ responsible_team_id 必须非空（谁担责必须指明）
+        #   NON_TEAM ⇒ responsible_team_id 必须为 NULL（外部责任，无单一担责班组，不得被误当责任班组）
+        CheckConstraint(
+            "(responsibility_kind <> 'TEAM' OR responsible_team_id IS NOT NULL) "
+            "AND (responsibility_kind <> 'NON_TEAM' OR responsible_team_id IS NULL)",
+            name="ck_rework_order_resp_team"),
+        # PENDING 不得进入计价：禁止 (PENDING + chargeability='chargeable') 共存
+        CheckConstraint(
+            "NOT (responsibility_kind = 'PENDING' AND chargeability = 'chargeable')",
+            name="ck_rework_order_pending_chargeable"),
+        # ORANGE-3（R6）：NULL ≡ PENDING，未形成责任判定的行同样不得记为可计价。
+        # 数据库层显式拒绝 (NULL + chargeability='chargeable')，与 PENDING 保持一致。
+        CheckConstraint(
+            "NOT (responsibility_kind IS NULL AND chargeability = 'chargeable')",
+            name="ck_rework_order_null_chargeable"),
         Index("ix_rework_order_source", "source_ref_type", "source_ref_id"),
         {"schema": SCHEMA},
     )
@@ -174,6 +190,26 @@ class ReworkOrder(TableBase, BFactMixin):
     rework_scope: Mapped[str | None] = mapped_column(String(255))
     reason_category_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("ref.reason_dictionary.id", ondelete="RESTRICT"), nullable=False)
+    chargeability: Mapped[str | None] = mapped_column(
+        String(16),
+        # 修 ORM 漂移（R4 §十一）：与 DB / Alembic migration 一致，取值含 pending（三值）。
+        CheckConstraint("chargeability IN ('chargeable','non_chargeable','pending')", name="ck_rework_order_chargeability_values"),
+        nullable=True)
+    # 返工责任主体可追溯（ORANGE-2）：谁造成问题/承担责任；与执行返工班组（production_task.execute_team_id）区分。
+    responsible_team_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("md.team.id", ondelete="RESTRICT"), nullable=True)
+    # 第4轮：明确责任判定结果（单一权威来源）。
+    #   TEAM     : 明确某个班组承担责任（responsible_team_id 必须存在）
+    #   NON_TEAM : 明确责任不属于执行班组（图纸/材料/前道工序/客户变更等外部原因）
+    #   PENDING  : 责任尚未确认，不得进入劳务结算
+    #   NULL     : 未设置 = 无责任依据，按 PENDING 等价处理（不可结算）
+    # 注意：不要把 ref.reason_dictionary.parent_category（异常分类）当 responsibility_kind。
+    responsibility_kind: Mapped[str | None] = mapped_column(
+        String(16),
+        CheckConstraint(
+            "responsibility_kind IS NULL OR responsibility_kind IN ('TEAM','NON_TEAM','PENDING')",
+            name="ck_rework_order_resp_kind_values"),
+        nullable=True)
     approved_ref_type: Mapped[str | None] = mapped_column(String(32), server_default=text("'approval_record'"))
     approved_ref_id: Mapped[int | None] = mapped_column(BigInteger)
 

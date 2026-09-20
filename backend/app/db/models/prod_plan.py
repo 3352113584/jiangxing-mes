@@ -116,6 +116,8 @@ class ProductionTask(TableBase, ALifecycleMixin):
         BigInteger, ForeignKey("prod.production_plan_line.id", ondelete="RESTRICT"))
     rework_of_task_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("prod.production_task.id", ondelete="RESTRICT"))
+    rework_order_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("prod.rework_order.id", ondelete="RESTRICT"))
     planned_start: Mapped[date | None] = mapped_column(Date)
     planned_end: Mapped[date | None] = mapped_column(Date)
     actual_start: Mapped[datetime | None] = mapped_column(DateTime)

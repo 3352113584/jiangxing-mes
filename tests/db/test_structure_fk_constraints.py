@@ -4,8 +4,8 @@ import pytest
 from conftest import ALL_SCHEMAS, fails, succeeds
 from helpers import B
 
-EXPECTED_PER_SCHEMA = {"aud": 13, "eng": 11, "imp": 5, "md": 18, "prod": 34,
-                       "ref": 13, "ship": 14, "whs": 23}
+EXPECTED_PER_SCHEMA = {"aud": 13, "eng": 18, "imp": 5, "md": 20, "prod": 34,
+                       "ref": 14, "ship": 14, "whs": 23}
 EXPECTED_SEED = {"operation_type": 16, "inspection_type": 4, "exception_category": 7,
                  "acceptance_result": 4, "subproject_type": 4, "reason_dictionary": 12,
                  "unit_of_measure": 6, "code_rule": 12, "system_config": 4,
@@ -18,7 +18,7 @@ class TestAStructure:
             "SELECT n.nspname, count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
             "WHERE c.relkind = 'r' AND n.nspname = ANY(%s) GROUP BY 1", (ALL_SCHEMAS,)).fetchall()
         assert dict(rows) == EXPECTED_PER_SCHEMA
-        assert sum(r[1] for r in rows) == 131
+        assert sum(r[1] for r in rows) == 141
 
     def test_a2_22_enum_types(self, conn):
         n = conn.execute("SELECT count(*) FROM pg_type WHERE typtype = 'e' "
@@ -33,12 +33,13 @@ class TestAStructure:
 
 
 class TestBForeignKeys:
-    def test_b1_total_fk_216(self, conn):
+    def test_b1_total_fk_243(self, conn):
+        # 本轮 c1 迁移给 prod.rework_order 新增 responsible_team_id FK(md.team)，FK 总数 242 → 243。
         n = conn.execute(
             "SELECT count(*) FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
             "JOIN pg_namespace n2 ON n2.oid = c.relnamespace "
             "WHERE con.contype = 'f' AND n2.nspname = ANY(%s)", (ALL_SCHEMAS,)).fetchone()[0]
-        assert n == 216
+        assert n == 243
 
     def test_b2_deferred_cycle_fks_present(self, conn):
         """3 个 use_alter 循环 FK（autogenerate 不生成，迁移手工补）。"""
@@ -72,9 +73,13 @@ class TestCConstraints:
         uq = conn.execute(f"SELECT count(*) {base} AND con.contype='u'", (ALL_SCHEMAS,)).fetchone()[0]
         ck = conn.execute(f"SELECT count(*) {base} AND con.contype='c'",
                           (ALL_SCHEMAS,)).fetchone()[0]
-        assert pk == 131, f"PK 期望 131 实际 {pk}"
-        assert uq == 89, f"UNIQUE 期望 89 实际 {uq}"
-        assert ck == 71, f"CHECK 期望 71 实际 {ck}"
+        assert pk == 141, f"PK 期望 141 实际 {pk}"
+        assert uq == 100, f"UNIQUE 期望 100 实际 {uq}"
+        # CHECK 期望 86 = 原 82 + c6 三个 rework_order 责任判定防旁路 CK
+        #   (ck_rework_order_resp_kind_values / ck_rework_order_resp_team / ck_rework_order_pending_chargeable)
+        # + c8 新增 1 个 ORANGE-3 一致性 CK (ck_rework_order_null_chargeable：NULL+chargeable 拒绝)。
+        # （chargeability 三值 CK 为同名重建，不计新增；FK/UNIQUE/PK 数量均不变）
+        assert ck == 86, f"CHECK 期望 86（原 82 + c6 三个 + c8 一个 ORANGE-3 CK） 实际 {ck}"
 
     def test_c2_nb3_action_key_unique(self, conn):
         """NB-3：action_key 业务动作幂等 = (task_id, action_key) UNIQUE。"""

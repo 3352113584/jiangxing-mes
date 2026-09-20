@@ -253,3 +253,32 @@ class StorageLocation(TableBase, AMasterDataMixin):
     )
     warehouse_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("md.warehouse.id", ondelete="RESTRICT"), nullable=False)
     loc_code: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class TeamOperationCapability(TableBase, ALifecycleMixin):
+    """3.4 班组×工序能力（M-N）：仅表达班组可承接的工序范围，绝不作派工/登记强制校验；
+    不影响 actual_component 主责/执行班组，劳务归属以实际执行记录为准。"""
+    __tablename__ = "team_operation_capability"
+    __table_args__ = (
+        UniqueConstraint("team_id", "operation_type_id", name="uq_team_operation_capability_team_op"),
+        Index("ix_team_operation_capability_operation_type_id", "operation_type_id"),
+        {"schema": SCHEMA},
+    )
+    team_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("md.team.id", ondelete="RESTRICT"), nullable=False)
+    operation_type_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    effective_from: Mapped[date | None] = mapped_column(Date)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+
+
+class EmployeeOccupation(TableBase, ALifecycleMixin):
+    """3.4 员工职业/岗位能力（M-N，多值平权）；md.employee 不加列。
+    与 team_operation_capability 正交（职业≠工序能力≠执行班组）。"""
+    __tablename__ = "employee_occupation"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "occupation_id", name="uq_employee_occupation_emp_occ"),
+        Index("ix_employee_occupation_occupation_id", "occupation_id"),
+        {"schema": SCHEMA},
+    )
+    employee_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("md.employee.id", ondelete="RESTRICT"), nullable=False)
+    occupation_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("ref.employee_occupation_dict.id", ondelete="RESTRICT"), nullable=False)

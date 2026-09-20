@@ -125,7 +125,17 @@ def register(
         )
     ).scalars().first()
     if existing is not None:
-        return _result_from_report(db, existing, idempotent=True, status="completed")
+        # 同 client_token（网络重试/重放）→ 幂等返回首次结果；
+        # 不同 client_token（他人/另一并发请求已先完成同一动作）→ 明确 ALREADY_COMPLETED，
+        # 不得因幂等查询时机不同而有时返回成功、有时返回错误（ORANGE-C 稳定语义）。
+        if existing.client_token == client_token:
+            return _result_from_report(db, existing, idempotent=True, status="completed")
+        raise BusinessError(
+            "ALREADY_COMPLETED",
+            "该构件此工序已由他人登记完成",
+            409,
+            extra={"report_id": existing.id, "task_id": task.id},
+        )
 
     # 5. 并发 + 状态机：锁定任务行，串行化同构件同工序登记
     task = db.execute(

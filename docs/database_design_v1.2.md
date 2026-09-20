@@ -65,7 +65,7 @@
 
 - A 类表标配：`id, …业务列…, is_active BOOLEAN DEFAULT TRUE（主数据）, created_by, created_at, updated_by, updated_at, version`。
 - B/D 类事实表标配：`id, …事实列…, occurred_at NOT NULL, recorded_at NOT NULL DEFAULT now(), created_by`。
-- 数字精度：重量 `NUMERIC(12,3)`（kg，3 位小数——兼容 6514.655 类清单值舍入差）；长度 `NUMERIC(10,2)`（mm）；数量（件）`INT`；金额/单价仅登记 `NUMERIC(14,2)`（不做财务）。
+- 数字精度：重量 `NUMERIC(12,3)`（kg，3 位小数——兼容 6514.655 类清单值舍入差）；长度 `NUMERIC(10,2)`（mm）；数量（件）`INT`；金额/单价登记 `NUMERIC(14,2)`（供生产/采购成本试算参考，不接入财务总账）。
 
 ---
 

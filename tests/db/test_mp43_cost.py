@@ -101,11 +101,32 @@ def add_price(conn, po_id, price, basis, eff_from, eff_to=None, is_current=True)
         (po_id, po_id, price, basis, eff_from, eff_to, is_current, NOW))
 
 
-def make_task(conn, acid, step, team, attempt=1, rework_of=None):
+def make_task(conn, acid, step, team, attempt=1, rework_of=None, rework_order_id=None):
     return conn.execute(
         "INSERT INTO prod.production_task(actual_component_id,route_template_step_id,attempt,"
-        "execute_team_id,make_type,rework_of_task_id) VALUES (%s,%s,%s,%s,'inhouse',%s) RETURNING id",
-        (acid, step, attempt, team, rework_of)).fetchone()[0]
+        "execute_team_id,make_type,rework_of_task_id,rework_order_id) "
+        "VALUES (%s,%s,%s,%s,'inhouse',%s,%s) RETURNING id",
+        (acid, step, attempt, team, rework_of, rework_order_id)).fetchone()[0]
+
+
+def make_rework_order(conn, reason_category_id, source_ref_id,
+                      chargeability=None, responsible_team_id=None, responsibility_kind=None):
+    """创建一张返工单。
+
+    第4轮起：responsibility_kind 为计价权威来源（TEAM/NON_TEAM/PENDING）；
+    chargeability（stored）仅作记录，不参与最终计价。
+    responsible_team_id 标识"责任班组（谁造成问题）"，区别于执行返工班组。
+    """
+    cols = ["order_no", "source_type", "source_ref_type", "source_ref_id",
+            "reason_category_id", "chargeability", "responsible_team_id", "occurred_at"]
+    params = [_uid("RO"), "inspection", "task", source_ref_id,
+              reason_category_id, chargeability, responsible_team_id, NOW]
+    if responsibility_kind is not None:
+        cols.append("responsibility_kind"); params.append(responsibility_kind)
+    ph = "(" + ",".join(["%s"] * len(cols)) + ")"
+    return conn.execute(
+        f"INSERT INTO prod.rework_order({','.join(cols)}) VALUES {ph} RETURNING id",
+        params).fetchone()[0]
 
 
 def make_report(conn, task_id, acid, step_id, team_id, occurred_at,
@@ -288,14 +309,23 @@ def test_rework_attempt_separate(conn):
     acid = make_component(conn, sid, "C1")
     t1 = make_task(conn, acid, step, team, attempt=1)
     make_report(conn, t1, acid, step, team, NOW)
-    t2 = make_task(conn, acid, step, team, attempt=2, rework_of=t1)
+    # 返工必须挂合法的"可计酬返工单"：非班组责任原因（material 等外部）→ NON_TEAM（责任判定），计酬。
+    # 第4轮：最终计价只由 responsibility_kind 推导；chargeability 仅作记录不参与计价。
+    rc = conn.execute(
+        "SELECT id FROM ref.reason_dictionary WHERE parent_category <> 'quality' ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    ro = make_rework_order(conn, rc, t1, chargeability="chargeable", responsibility_kind="NON_TEAM")
+    t2 = make_task(conn, acid, step, team, attempt=2, rework_of=t1, rework_order_id=ro)
     make_report(conn, t2, acid, step, team, NOW)
     rows = trial(conn, project_operation_id=po)
     assert len(rows) == 2
     normal = [r for r in rows if not r.is_rework]
     rework = [r for r in rows if r.is_rework]
     assert len(normal) == 1 and len(rework) == 1
+    # 正常 50 + 可计酬返工 50（合法 chargeable 返工计入）
     assert normal[0].amount == 50.0 and rework[0].amount == 50.0
+    # 新模型：责任班组 NULL + 显式 chargeable（material 等外部原因）→ REWORK_EXTERNAL（计酬）
+    assert rework[0].anomaly_status == "REWORK_EXTERNAL"
     # 返工不覆盖/删除正常事实：汇总正常+返工=合计
     summ = conn.execute(
         "SELECT normal_count,rework_count,normal_cost,rework_cost,total_cost "

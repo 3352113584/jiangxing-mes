@@ -153,3 +153,9 @@ class AcceptanceResult(DictBase):
     """2.11 到货验收结论受控值域（N-2 落点）。"""
     __tablename__ = "acceptance_result"
     __table_args__ = {"schema": SCHEMA}
+
+
+class EmployeeOccupationDict(DictBase):
+    """2.x 员工职业/岗位字典（M3）；循 DictBase，不写 CHECK，值由业务维护。"""
+    __tablename__ = "employee_occupation_dict"
+    __table_args__ = {"schema": SCHEMA}

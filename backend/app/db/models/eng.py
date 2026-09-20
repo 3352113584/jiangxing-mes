@@ -152,12 +152,19 @@ class RouteTemplate(TableBase, ALifecycleMixin):
     __tablename__ = "route_template"
     __table_args__ = (
         CheckConstraint("main_project_id IS NOT NULL OR subproject_id IS NOT NULL", name="ck_route_template_scope_at_least_one"),
+        Index("ix_route_template_standard_template_id", "standard_template_id"),
         {"schema": SCHEMA},
     )
     main_project_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("md.main_project.id", ondelete="RESTRICT"))
     subproject_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("md.subproject.id", ondelete="RESTRICT"))
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # M4/M5 标准工艺模板来源追溯（ADDITIVE；不破坏 N-6 与现有关系）：
+    # 项目实际路线由标准模板"采用/复制"而来，项目实例修改不反向影响标准模板。
+    standard_template_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("eng.component_type_process_template.id", ondelete="RESTRICT"), nullable=True)
+    standard_template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    adopted_by: Mapped[int | None] = mapped_column(BigInteger)
+    adopted_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class RouteTemplateStep(TableBase, ALifecycleMixin):
@@ -234,3 +241,133 @@ class ProjectOperationPrice(TableBase, BFactMixin):
     effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
+
+
+# ============ V1.2 劳务业务第2轮整改（M2/M4/M6）新增实体 ============
+# 全部为 ADDITIVE：不修改任何 V1.2 冻结核心表，不触碰 actual_component/plan/task/report 既有关系。
+# 命名与《班组能力-构件类型-工艺模板-劳务计价业务设计审查报告》C.2 节一致。
+
+class ComponentTypeProcessTemplate(TableBase, ALifecycleMixin):
+    """M4 构件类型工艺标准模板头（可跨项目复用，版本化）。
+
+    项目实际路线由本模板'采用/复制'而来（见 RouteTemplate.standard_template_id 来源追溯），
+    项目实例修改不反向影响本模板（解决模板污染）。"""
+    __tablename__ = "component_type_process_template"
+    __table_args__ = (
+        UniqueConstraint("component_type_id", "version_no", name="uq_ctpt_component_type_version"),
+        Index("ix_ctpt_current", "component_type_id", unique=True, postgresql_where=text("is_current")),
+        {"schema": SCHEMA},
+    )
+    component_type_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("ref.component_type_dict.id", ondelete="RESTRICT"), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    template_name: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(
+        String(16),
+        CheckConstraint("status IN ('active','deprecated')", name="ck_ctpt_status_values"),
+        nullable=False, server_default=text("'active'"))
+    effective_from: Mapped[date | None] = mapped_column(Date)
+    effective_to: Mapped[date | None] = mapped_column(Date)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+
+class ComponentTypeProcessStep(TableBase, ALifecycleMixin):
+    """M4 模板工序行（镜像 route_template_step）；operation_type_id XOR project_operation_id。
+
+    被生产计划引用后语义列 T-5 同构禁改；新内容=新 step_no 新行（MCR-1）。"""
+    __tablename__ = "component_type_process_step"
+    __table_args__ = (
+        UniqueConstraint("template_id", "step_no", name="uq_ctps_template_step_no"),
+        CheckConstraint(
+            "(operation_type_id IS NOT NULL AND project_operation_id IS NULL) OR "
+            "(operation_type_id IS NULL AND project_operation_id IS NOT NULL)",
+            name="ck_ctps_op_xor"),
+        CheckConstraint("step_status IN ('active','deprecated')", name="ck_ctps_step_status_values"),
+        {"schema": SCHEMA},
+    )
+    template_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("eng.component_type_process_template.id", ondelete="RESTRICT"), nullable=False)
+    step_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation_type_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"), nullable=True)
+    project_operation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("eng.project_operation.id", ondelete="RESTRICT"), nullable=True)
+    default_requirement: Mapped[str | None] = mapped_column(String(255))
+    step_status: Mapped[str] = mapped_column(
+        String(16),
+        CheckConstraint("step_status IN ('active','deprecated')", name="ck_ctps_step_status_values"),
+        nullable=False, server_default=text("'active'"))
+
+
+class LaborPricingRule(TableBase, ALifecycleMixin):
+    """M6 劳务计价基础规则头（配置层，不在生产事实表加列）。
+
+    维度键：构件类型 × 工序(标准/自定义) × 可选班组（applicable_team_id 为空=通用/所有班组）。
+    值经 labor_pricing_rule_version 给出（一行一价、被引用即冻结，镜像 T-17 哲学）。"""
+    __tablename__ = "labor_pricing_rule"
+    __table_args__ = (
+        CheckConstraint(
+            "(operation_type_id IS NOT NULL AND project_operation_id IS NULL) OR "
+            "(operation_type_id IS NULL AND project_operation_id IS NOT NULL)",
+            name="ck_lpr_op_xor"),
+        # 构件类型×工序(取非空者)×班组(空=0) 唯一；班组为空表示通用价。
+        Index("uq_lpr_dim",
+              text("component_type_id"),
+              text("COALESCE(operation_type_id, project_operation_id)"),
+              text("COALESCE(applicable_team_id, 0)"),
+              unique=True),
+        {"schema": SCHEMA},
+    )
+    rule_code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    name: Mapped[str | None] = mapped_column(String(128))
+    component_type_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("ref.component_type_dict.id", ondelete="RESTRICT"), nullable=False)
+    operation_type_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ref.operation_type.id", ondelete="RESTRICT"), nullable=True)
+    project_operation_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("eng.project_operation.id", ondelete="RESTRICT"), nullable=True)
+    applicable_team_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("md.team.id", ondelete="RESTRICT"), nullable=True)
+    price_unit_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("ref.unit_of_measure.id", ondelete="RESTRICT"), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+
+class LaborPricingRuleVersion(TableBase, BFactMixin):
+    """M6 计价规则版本（一行一价、被结算引用即冻结，镜像 P4-3 的 T-17 守卫哲学）。
+
+    守卫（应用层 + 触发器兜底）：区间不重叠、单一当前、已生效版本禁改 unit_price/effective_from、禁重开 effective_to。"""
+    __tablename__ = "labor_pricing_rule_version"
+    __table_args__ = (
+        UniqueConstraint("rule_id", "version_no", name="uq_lprv_rule_version"),
+        CheckConstraint("effective_to IS NULL OR effective_to >= effective_from", name="ck_lprv_range"),
+        Index("ix_lprv_current", "rule_id", unique=True, postgresql_where=text("is_current")),
+        {"schema": SCHEMA},
+    )
+    rule_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("eng.labor_pricing_rule.id", ondelete="RESTRICT"), nullable=False)
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    approved_by: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class LaborPricingCondition(TableBase, ALifecycleMixin):
+    """M6 计价规则适用条件行（规格/重量/长度等；条件类型自由 VARCHAR 不写死）。
+
+    同一 version 多行之间为 AND 关系；condition_type 不写 CHECK，未来可扩展（weight/piece/length/hour/hole_count…）。"""
+    __tablename__ = "labor_pricing_condition"
+    __table_args__ = (
+        UniqueConstraint("rule_version_id", "condition_type", name="uq_lpc_version_condition"),
+        {"schema": SCHEMA},
+    )
+    rule_version_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("eng.labor_pricing_rule_version.id", ondelete="RESTRICT"), nullable=False)
+    condition_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    operator: Mapped[str] = mapped_column(String(8), nullable=False)  # '>=','<=','>','<','between'
+    value_low: Mapped[float | None] = mapped_column(Numeric(18, 4))
+    value_high: Mapped[float | None] = mapped_column(Numeric(18, 4))
+    unit_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("ref.unit_of_measure.id", ondelete="RESTRICT"), nullable=True)

@@ -30,6 +30,7 @@ class ComponentListItem(TableBase, ALifecycleMixin):
     subproject_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("md.subproject.id", ondelete="RESTRICT"), nullable=False)
     component_no: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    component_type_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("ref.component_type_dict.id", ondelete="RESTRICT"), nullable=True)
     drawing_no: Mapped[str | None] = mapped_column(String(64))
     drawing_revision_no: Mapped[str | None] = mapped_column(String(32))
     engineering_object_key: Mapped[str | None] = mapped_column(String(128))
@@ -79,6 +80,7 @@ class ActualComponent(TableBase, ALifecycleMixin):
         BigInteger, ForeignKey("prod.component_list_item.id", ondelete="RESTRICT"), nullable=False)
     component_no: Mapped[str] = mapped_column(String(64), nullable=False)
     instance_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    component_type_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("ref.component_type_dict.id", ondelete="RESTRICT"), nullable=True)
     qr_code_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("prod.qr_code_registry.id", ondelete="RESTRICT", use_alter=True), nullable=False)
     production_status: Mapped[str] = mapped_column(enum_ac_production, nullable=False, server_default=text("'not_started'"))
